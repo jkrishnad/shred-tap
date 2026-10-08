@@ -28,13 +28,32 @@ fn read_bytes(bytes: &[u8], range: Range<usize>) -> Result<&[u8]> {
     })
 }
 
-pub fn slot(bytes: &[u8]) -> Result<u64> {
-    let bytes = read_bytes(bytes, SLOT)?;
+fn read_u16(bytes: &[u8], range: Range<usize>) -> Result<u16> {
+    let bytes = read_bytes(bytes, range)?;
+    let mut arr = [0u8; 2];
+    arr.copy_from_slice(bytes);
+    let value = u16::from_le_bytes(arr);
+    Ok(value)
+}
 
+fn read_u32(bytes: &[u8], range: Range<usize>) -> Result<u32> {
+    let bytes = read_bytes(bytes, range)?;
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(bytes);
+    let value = u32::from_le_bytes(arr);
+    Ok(value)
+}
+
+fn read_u64(bytes: &[u8], range: Range<usize>) -> Result<u64> {
+    let bytes = read_bytes(bytes, range)?;
     let mut arr = [0u8; 8];
     arr.copy_from_slice(bytes);
-    let slot = u64::from_le_bytes(arr);
+    let value = u64::from_le_bytes(arr);
+    Ok(value)
+}
 
+pub fn slot(bytes: &[u8]) -> Result<u64> {
+    let slot = read_u64(bytes, SLOT)?;
     Ok(slot)
 }
 
@@ -48,33 +67,76 @@ pub fn variant(bytes: &[u8]) -> Result<u8> {
 }
 
 pub fn version(bytes: &[u8]) -> Result<u16> {
-    let bytes = read_bytes(bytes, VERSION)?;
-    let mut arr = [0u8; 2];
-    arr.copy_from_slice(bytes);
-
-    let version = u16::from_le_bytes(arr);
+    let version = read_u16(bytes, VERSION)?;
     Ok(version)
 }
 
 pub fn index(bytes: &[u8]) -> Result<u32> {
-    let bytes = read_bytes(bytes, INDEX)?;
-    let mut arr = [0u8; 4];
-    arr.copy_from_slice(bytes);
-    let index = u32::from_le_bytes(arr);
+    let index = read_u32(bytes, INDEX)?;
     Ok(index)
 }
 
 pub fn fec_set_index(bytes: &[u8]) -> Result<u32> {
-    let bytes = read_bytes(bytes, FEC_SET_INDEX)?;
-    let mut arr = [0u8; 4];
-    arr.copy_from_slice(bytes);
-    let index = u32::from_le_bytes(arr);
-    Ok(index)
+    let fec_set_index = read_u32(bytes, FEC_SET_INDEX)?;
+    Ok(fec_set_index)
+}
+
+pub fn parent_offset(bytes: &[u8]) -> Result<u16> {
+    let parent_offset = read_u16(bytes, PARENT_OFFSET)?;
+    Ok(parent_offset)
+}
+
+pub fn flags(bytes: &[u8]) -> Result<u8> {
+    let flags = bytes.get(FLAGS).copied().ok_or(Error::TooShort {
+        expected: FLAGS + 1,
+        actual: bytes.len(),
+    })?;
+    Ok(flags)
+}
+
+pub fn data_size(bytes: &[u8]) -> Result<u16> {
+    let data_size = read_u16(bytes, DATA_SIZE)?;
+    Ok(data_size)
+}
+
+pub fn num_data(bytes: &[u8]) -> Result<u16> {
+    let num_data = read_u16(bytes, NUM_DATA)?;
+    Ok(num_data)
+}
+
+pub fn num_coding(bytes: &[u8]) -> Result<u16> {
+    let num_coding = read_u16(bytes, NUM_CODING)?;
+    Ok(num_coding)
+}
+
+pub fn position(bytes: &[u8]) -> Result<u16> {
+    let position = read_u16(bytes, POSITION)?;
+    Ok(position)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    // First data shred (0x96) and first coding shred (0x66) in tests/fixtures/real-10s.pcap,
+    // headers only. Same slot and FEC set, so the same signature.
+    pub const REAL_DATA: [u8; 88] = [
+        0x48, 0xfb, 0x02, 0xfc, 0xc0, 0x86, 0x6e, 0xf7, 0xff, 0x19, 0x7d, 0x95, 0x4e, 0xb7, 0xfc,
+        0xd9, 0x6a, 0x6d, 0xf2, 0xda, 0x37, 0xc3, 0x0e, 0x4e, 0xdb, 0x6a, 0xa6, 0xa6, 0xc7, 0x0e,
+        0xdc, 0x26, 0xa0, 0x3f, 0xfb, 0x2d, 0x95, 0x65, 0x34, 0xde, 0x45, 0x26, 0x4c, 0x6b, 0x65,
+        0x9f, 0xc4, 0x55, 0x82, 0x32, 0x84, 0x8e, 0x63, 0xad, 0x13, 0x78, 0xbf, 0x59, 0x31, 0xbc,
+        0xb8, 0x81, 0x8a, 0x00, 0x96, 0x41, 0x4b, 0xcd, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00,
+        0x00, 0x00, 0x69, 0x11, 0x40, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x1b, 0x04,
+    ];
+
+    pub const REAL_CODE: [u8; 89] = [
+        0x48, 0xfb, 0x02, 0xfc, 0xc0, 0x86, 0x6e, 0xf7, 0xff, 0x19, 0x7d, 0x95, 0x4e, 0xb7, 0xfc,
+        0xd9, 0x6a, 0x6d, 0xf2, 0xda, 0x37, 0xc3, 0x0e, 0x4e, 0xdb, 0x6a, 0xa6, 0xa6, 0xc7, 0x0e,
+        0xdc, 0x26, 0xa0, 0x3f, 0xfb, 0x2d, 0x95, 0x65, 0x34, 0xde, 0x45, 0x26, 0x4c, 0x6b, 0x65,
+        0x9f, 0xc4, 0x55, 0x82, 0x32, 0x84, 0x8e, 0x63, 0xad, 0x13, 0x78, 0xbf, 0x59, 0x31, 0xbc,
+        0xb8, 0x81, 0x8a, 0x00, 0x66, 0x41, 0x4b, 0xcd, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x57, 0x00,
+        0x00, 0x00, 0x69, 0x11, 0x40, 0x00, 0x00, 0x00, 0x20, 0x00, 0x20, 0x00, 0x17, 0x00,
+    ];
 
     #[test]
     fn test_byte_range() {
@@ -186,6 +248,107 @@ mod tests {
             Err(Error::TooShort {
                 expected: 83,
                 actual: 82
+            })
+        ));
+    }
+
+    #[test]
+    fn test_real_data_common_header() {
+        assert_eq!(variant(&REAL_DATA).unwrap(), 0x96);
+        assert_eq!(slot(&REAL_DATA).unwrap(), 449_661_761);
+        assert_eq!(index(&REAL_DATA).unwrap(), 74);
+        assert_eq!(version(&REAL_DATA).unwrap(), 4457);
+        assert_eq!(fec_set_index(&REAL_DATA).unwrap(), 64);
+    }
+
+    #[test]
+    fn test_real_code_common_header() {
+        assert_eq!(variant(&REAL_CODE).unwrap(), 0x66);
+        assert_eq!(slot(&REAL_CODE).unwrap(), 449_661_761);
+        assert_eq!(index(&REAL_CODE).unwrap(), 87);
+        assert_eq!(version(&REAL_CODE).unwrap(), 4457);
+        assert_eq!(fec_set_index(&REAL_CODE).unwrap(), 64);
+    }
+
+    #[test]
+    fn test_real_same_signature() {
+        assert_eq!(REAL_DATA[SIGNATURE], REAL_CODE[SIGNATURE]);
+    }
+
+    #[test]
+    fn test_real_data_header() {
+        assert_eq!(parent_offset(&REAL_DATA).unwrap(), 1);
+        assert_eq!(flags(&REAL_DATA).unwrap(), 0);
+        assert_eq!(data_size(&REAL_DATA).unwrap(), 1051);
+    }
+
+    #[test]
+    fn test_flags_last_in_slot() {
+        let mut bytes = [0xFFu8; 88];
+        bytes[85] = 0b1100_0000;
+        assert_eq!(flags(&bytes).unwrap(), 0b1100_0000);
+    }
+
+    #[test]
+    fn test_data_header_fail() {
+        assert!(matches!(
+            parent_offset(&[0u8; 84]),
+            Err(Error::TooShort {
+                expected: 85,
+                actual: 84
+            })
+        ));
+        assert!(matches!(
+            flags(&[0u8; 85]),
+            Err(Error::TooShort {
+                expected: 86,
+                actual: 85
+            })
+        ));
+        assert!(matches!(
+            data_size(&[0u8; 87]),
+            Err(Error::TooShort {
+                expected: 88,
+                actual: 87
+            })
+        ));
+    }
+
+    // Coding header readers, yours to implement
+
+    #[test]
+    fn test_real_code_header() {
+        assert_eq!(num_data(&REAL_CODE).unwrap(), 32);
+        assert_eq!(num_coding(&REAL_CODE).unwrap(), 32);
+        assert_eq!(position(&REAL_CODE).unwrap(), 23);
+        // position is this shred's place among the coding shreds of the set
+        assert_eq!(
+            fec_set_index(&REAL_CODE).unwrap() + position(&REAL_CODE).unwrap() as u32,
+            index(&REAL_CODE).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_code_header_fail() {
+        assert!(matches!(
+            num_data(&[0u8; 84]),
+            Err(Error::TooShort {
+                expected: 85,
+                actual: 84
+            })
+        ));
+        assert!(matches!(
+            num_coding(&[0u8; 86]),
+            Err(Error::TooShort {
+                expected: 87,
+                actual: 86
+            })
+        ));
+        assert!(matches!(
+            position(&[0u8; 88]),
+            Err(Error::TooShort {
+                expected: 89,
+                actual: 88
             })
         ));
     }
