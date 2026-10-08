@@ -1,3 +1,5 @@
+//! Reads single fields straight from raw shred bytes, without parsing the whole shred.
+
 use crate::error::{Error, Result};
 use std::ops::Range;
 
@@ -20,6 +22,7 @@ pub const NUM_DATA: Range<usize> = 83..85;
 pub const NUM_CODING: Range<usize> = 85..87;
 pub const POSITION: Range<usize> = 87..89;
 
+/// Returns the bytes in `range`, or TooShort if the packet ends before it.
 fn read_bytes(bytes: &[u8], range: Range<usize>) -> Result<&[u8]> {
     let expected = range.end;
     bytes.get(range).ok_or(Error::TooShort {
@@ -52,11 +55,13 @@ fn read_u64(bytes: &[u8], range: Range<usize>) -> Result<u64> {
     Ok(value)
 }
 
+/// Slot this shred belongs to.
 pub fn slot(bytes: &[u8]) -> Result<u64> {
     let slot = read_u64(bytes, SLOT)?;
     Ok(slot)
 }
 
+/// Raw variant byte: shred type
 pub fn variant(bytes: &[u8]) -> Result<u8> {
     let variant = bytes.get(VARIANT).copied().ok_or(Error::TooShort {
         expected: VARIANT + 1,
@@ -66,26 +71,31 @@ pub fn variant(bytes: &[u8]) -> Result<u8> {
     Ok(variant)
 }
 
+/// Shred version, which identifies the cluster the shred is for.
 pub fn version(bytes: &[u8]) -> Result<u16> {
     let version = read_u16(bytes, VERSION)?;
     Ok(version)
 }
 
+/// Position of this shred within its slot.
 pub fn index(bytes: &[u8]) -> Result<u32> {
     let index = read_u32(bytes, INDEX)?;
     Ok(index)
 }
 
+/// Index of the first data shred in this shred's FEC set.
 pub fn fec_set_index(bytes: &[u8]) -> Result<u32> {
     let fec_set_index = read_u32(bytes, FEC_SET_INDEX)?;
     Ok(fec_set_index)
 }
 
+/// Data shred: how many slots back the parent slot is.
 pub fn parent_offset(bytes: &[u8]) -> Result<u16> {
     let parent_offset = read_u16(bytes, PARENT_OFFSET)?;
     Ok(parent_offset)
 }
 
+/// Data shred: reference tick and the batch complete / last in slot bits.
 pub fn flags(bytes: &[u8]) -> Result<u8> {
     let flags = bytes.get(FLAGS).copied().ok_or(Error::TooShort {
         expected: FLAGS + 1,
@@ -94,21 +104,25 @@ pub fn flags(bytes: &[u8]) -> Result<u8> {
     Ok(flags)
 }
 
+/// Data shred: end of the block data, counted from byte 0 (headers included).
 pub fn data_size(bytes: &[u8]) -> Result<u16> {
     let data_size = read_u16(bytes, DATA_SIZE)?;
     Ok(data_size)
 }
 
+/// Coding shred: number of data shreds in the FEC set.
 pub fn num_data(bytes: &[u8]) -> Result<u16> {
     let num_data = read_u16(bytes, NUM_DATA)?;
     Ok(num_data)
 }
 
+/// Coding shred: number of coding shreds in the FEC set.
 pub fn num_coding(bytes: &[u8]) -> Result<u16> {
     let num_coding = read_u16(bytes, NUM_CODING)?;
     Ok(num_coding)
 }
 
+/// Coding shred: its place among the coding shreds of the set.
 pub fn position(bytes: &[u8]) -> Result<u16> {
     let position = read_u16(bytes, POSITION)?;
     Ok(position)
@@ -118,7 +132,7 @@ pub fn position(bytes: &[u8]) -> Result<u16> {
 pub(crate) mod tests {
     use super::*;
 
-    // First data shred (0x96) and first coding shred (0x66) in tests/fixtures/real-10s.pcap,
+    // First data shred (0x96) and first coding shred (0x66) from our sample data.
     // headers only. Same slot and FEC set, so the same signature.
     pub const REAL_DATA: [u8; 88] = [
         0x48, 0xfb, 0x02, 0xfc, 0xc0, 0x86, 0x6e, 0xf7, 0xff, 0x19, 0x7d, 0x95, 0x4e, 0xb7, 0xfc,
