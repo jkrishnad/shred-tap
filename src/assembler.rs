@@ -1,5 +1,11 @@
 //! Turns a stream of shred packets into decoded transactions and block markers, with timing.
-//! Packets can arrive in any order, interleaved across slots, with duplicates and junk.
+//!
+//! push takes one packet, parses it and puts the shred into its FEC set.
+//! A set decodes as soon as it has 32 shreds, the earliest moment the data can be known.
+//! Sets go to the slot's Batcher strictly in order, because a batch can start in one set and end in the next.
+//! Each finished batch is decoded and handed out as events, one per transaction or marker.
+//! A slot closes when its last shred is decoded, or when it falls too far behind the newest slot.
+//! Every event carries t0 (first shred of the set), t1 (32nd shred) and t2 (the batch could decode).
 
 use crate::block::{Batcher, Component, decode_component, is_last_in_slot};
 use crate::fec::{DATA_SHREDS, FecSet};
@@ -91,10 +97,6 @@ impl Assembler {
         Self::default()
     }
 
-    pub fn stats(&self) -> &Stats {
-        &self.stats
-    }
-
     /// Feeds one UDP payload. Returns whatever this packet made decodable.
     pub fn push(&mut self, payload: &[u8], recv_ns: u64) -> Vec<Event> {
         self.stats.packets += 1;
@@ -140,15 +142,6 @@ impl Assembler {
         }
 
         self.drain(slot, recv_ns)
-    }
-
-    /// End of input. Every set still waiting is counted as lost.
-    pub fn finish(&mut self) -> &Stats {
-        let slots: Vec<u64> = self.slots.keys().copied().collect();
-        for slot in slots {
-            self.close(slot);
-        }
-        &self.stats
     }
 
     /// Hands every rebuildable set, in order, to the slot's batcher and decodes finished batches.
@@ -239,6 +232,20 @@ impl Assembler {
             self.stats.sets_lost += state.sets.len() as u64;
         }
         self.closed.insert(slot, ());
+    }
+
+    /// End of input. Every set still waiting is counted as lost.
+    pub fn finish(&mut self) -> &Stats {
+        let slots: Vec<u64> = self.slots.keys().copied().collect();
+        for slot in slots {
+            self.close(slot);
+        }
+        &self.stats
+    }
+
+    /// Counters so far.
+    pub fn stats(&self) -> &Stats {
+        &self.stats
     }
 }
 

@@ -1,4 +1,8 @@
-//! Error type for the whole crate.
+//! The one Error type every module returns.
+//!
+//! Each variant names what went wrong with the input, so a caller can match on it.
+//! The assembler, for example, drops an unknown variant quietly but counts a short packet.
+//! thiserror writes the Display and std::error::Error impls from the attributes.
 
 /// Result with the crate's own Error.
 pub type Result<T> = std::result::Result<T, Error>;

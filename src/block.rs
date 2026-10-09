@@ -1,4 +1,11 @@
 //! Turns data shards into block components, either entry batches or block markers.
+//!
+//! data_payload takes the block bytes out of one data shard, skipping its headers and padding.
+//! The flags say whether a shard ends a batch or ends the slot.
+//! Batcher joins payloads in index order and hands over a batch when a shard ends one.
+//! decode_component reads the batch, an entry count above 0 means entries with transactions,
+//! 0 means a block marker such as the header or the footer.
+//! Data shards start at packet byte 64, so packet offsets are shifted by 64 in here.
 
 use crate::error::{Error, Result};
 use crate::wire;
@@ -83,27 +90,6 @@ impl Batcher {
     }
 }
 
-/// One PoH entry, same wire layout as Agave's solana-entry Entry.
-#[derive(Debug, SchemaRead)]
-pub struct Entry {
-    pub num_hashes: u64,
-    pub hash: Hash,
-    /// Empty for a tick entry.
-    pub transactions: Vec<VersionedTransaction>,
-}
-
-/// What one batch decodes to.
-#[derive(Debug)]
-pub enum Component {
-    Entries(Vec<Entry>),
-    /// Raw block marker. Variant 0 is the footer, 1 the header, 2 update parent, 3 genesis certificate.
-    Marker {
-        version: u16,
-        variant: u8,
-        data: Vec<u8>,
-    },
-}
-
 /// Entry count above 0 is an entry batch, 0 means a block marker follows.
 pub fn decode_component(batch: &[u8]) -> Result<Component> {
     let count = batch.get(..ENTRY_COUNT_SIZE).ok_or(Error::TooShort {
@@ -138,6 +124,27 @@ pub fn decode_component(batch: &[u8]) -> Result<Component> {
         variant,
         data: data.to_vec(),
     })
+}
+
+/// What one batch decodes to.
+#[derive(Debug)]
+pub enum Component {
+    Entries(Vec<Entry>),
+    /// Raw block marker. Variant 0 is the footer, 1 the header, 2 update parent, 3 genesis certificate.
+    Marker {
+        version: u16,
+        variant: u8,
+        data: Vec<u8>,
+    },
+}
+
+/// One PoH entry, same wire layout as Agave's solana-entry Entry.
+#[derive(Debug, SchemaRead)]
+pub struct Entry {
+    pub num_hashes: u64,
+    pub hash: Hash,
+    /// Empty for a tick entry.
+    pub transactions: Vec<VersionedTransaction>,
 }
 
 #[cfg(test)]

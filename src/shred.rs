@@ -1,4 +1,9 @@
-//! Turns raw shred bytes into a checked Shred, what kind it is and where it sits in its FEC set.
+//! Turns raw shred bytes into a checked Shred.
+//!
+//! parse_variant splits the variant byte into the kind (data or coding), the proof size and the resigned flag.
+//! shard_index works out where the shred sits in its FEC set, data at 0..32 and coding at 32..64.
+//! Shred::parse checks the variant and the header length once, so later stages can trust every field.
+//! layout computes where the shard and the Merkle tail sit in the packet, which depends on the variant.
 
 use crate::error::{Error, Result};
 use crate::wire;

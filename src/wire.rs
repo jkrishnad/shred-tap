@@ -1,4 +1,10 @@
 //! Reads single fields straight from raw shred bytes, without parsing the whole shred.
+//!
+//! First come the byte offsets of every header field, the same for every Merkle shred.
+//! Then small helpers that read 2, 4 or 8 little endian bytes and fail with TooShort instead of panicking.
+//! Then one reader per field, in the order the fields sit in the shred.
+//! The common header (signature to fec_set_index) is shared by data and coding shreds,
+//! after it data shreds have a data header and coding shreds a coding header at the same offsets.
 
 use crate::error::{Error, Result};
 use std::ops::Range;
@@ -59,12 +65,6 @@ fn read_u64(bytes: &[u8], range: Range<usize>) -> Result<u64> {
     Ok(value)
 }
 
-/// Slot this shred belongs to.
-pub fn slot(bytes: &[u8]) -> Result<u64> {
-    let slot = read_u64(bytes, SLOT)?;
-    Ok(slot)
-}
-
 /// Raw variant byte, shred type in the high 4 bits and Merkle proof size in the low 4.
 pub fn variant(bytes: &[u8]) -> Result<u8> {
     let variant = bytes.get(VARIANT).copied().ok_or(Error::TooShort {
@@ -75,16 +75,22 @@ pub fn variant(bytes: &[u8]) -> Result<u8> {
     Ok(variant)
 }
 
-/// Shred version, which identifies the cluster the shred is for.
-pub fn version(bytes: &[u8]) -> Result<u16> {
-    let version = read_u16(bytes, VERSION)?;
-    Ok(version)
+/// Slot this shred belongs to.
+pub fn slot(bytes: &[u8]) -> Result<u64> {
+    let slot = read_u64(bytes, SLOT)?;
+    Ok(slot)
 }
 
 /// Position of this shred within its slot.
 pub fn index(bytes: &[u8]) -> Result<u32> {
     let index = read_u32(bytes, INDEX)?;
     Ok(index)
+}
+
+/// Shred version, which identifies the cluster the shred is for.
+pub fn version(bytes: &[u8]) -> Result<u16> {
+    let version = read_u16(bytes, VERSION)?;
+    Ok(version)
 }
 
 /// Index of the first data shred in this shred's FEC set.

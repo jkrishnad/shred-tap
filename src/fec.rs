@@ -1,4 +1,10 @@
 //! Collects the shreds of one FEC set and rebuilds missing data shards with Reed-Solomon.
+//!
+//! A set has 64 places, 32 data shards then 32 coding shards, filled by shard index as shreds arrive.
+//! push checks each shred belongs here, drops duplicates and keeps only its shard bytes.
+//! Any 32 of the 64 are enough, so once 32 are in, recover fills the missing data places.
+//! data_shards then hands the 32 data shards over in order for the block decoder.
+//! The set also records when its first shred arrived (t0) and when it became rebuildable (t1).
 
 use crate::error::{Error, Result};
 use crate::shred::{Kind, Shred, layout};

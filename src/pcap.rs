@@ -1,4 +1,10 @@
 //! Reads a pcap capture and pulls the UDP payload out of each Ethernet frame.
+//!
+//! tcpdump does the capturing on the node, this module only reads what it wrote.
+//! PcapReader checks the 24 byte file header, then reads one record at a time,
+//! each a timestamp and one Ethernet frame. It reads from any Read, a file or a tcpdump pipe.
+//! udp_payload strips the Ethernet, IPv4 and UDP headers off a frame and returns the shred inside.
+//! pcap headers are little endian, network headers are big endian.
 
 use crate::error::{Error, Result};
 use std::io::Read;
@@ -88,26 +94,6 @@ impl<R: Read> PcapReader<R> {
     }
 }
 
-/// Fills as much of `buf` as the reader has and returns how many bytes that was.
-/// read_exact can't tell a clean end (0 bytes) from a cut record (some bytes), this can.
-fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(filled)
-}
-
-/// pcap headers are little endian on our capture, the callers pass exactly 4 bytes.
-fn le_u32(b: &[u8]) -> u32 {
-    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-
 /// The UDP payload of an Ethernet + IPv4 + UDP frame, or None for anything else.
 /// Network headers are big endian, unlike shred fields.
 pub fn udp_payload(frame: &[u8]) -> Option<&[u8]> {
@@ -131,6 +117,26 @@ pub fn udp_payload(frame: &[u8]) -> Option<&[u8]> {
     // UDP length includes its own 8 byte header, and it tells us where Ethernet padding starts
     let udp_len = usize::from(u16::from_be_bytes([len[0], len[1]]));
     frame.get(udp + UDP_HEADER_SIZE..udp + udp_len.max(UDP_HEADER_SIZE))
+}
+
+/// Fills as much of `buf` as the reader has and returns how many bytes that was.
+/// read_exact can't tell a clean end (0 bytes) from a cut record (some bytes), this can.
+fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(filled)
+}
+
+/// pcap headers are little endian on our capture, the callers pass exactly 4 bytes.
+fn le_u32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
 #[cfg(test)]
