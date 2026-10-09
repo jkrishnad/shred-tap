@@ -42,4 +42,16 @@ pub enum Error {
     /// Entry batch bytes that don't decode as entries.
     #[error("entry decode failed: {0}")]
     Decode(#[from] wincode::ReadError),
+    /// File doesn't start with a pcap magic number, for example a pcapng file.
+    #[error("not a pcap file, magic {0:#010x}")]
+    BadPcapMagic(u32),
+    /// Capture isn't Ethernet, for example `tcpdump -i any` writes Linux cooked (113).
+    #[error("unsupported pcap link type {0}, expected Ethernet (1)")]
+    UnsupportedLinkType(u32),
+    /// Capture ends in the middle of a header or a frame.
+    #[error("pcap file is truncated")]
+    TruncatedPcap,
+    /// Reading the capture failed.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
