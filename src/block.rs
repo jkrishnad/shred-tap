@@ -1,4 +1,4 @@
-//! Turns data shards into block components: entry batches and block markers.
+//! Turns data shards into block components, either entry batches or block markers.
 
 use crate::error::{Error, Result};
 use crate::wire;
@@ -14,12 +14,12 @@ const DATA_COMPLETE: u8 = 0b0100_0000;
 const LAST_IN_SLOT: u8 = 0b1100_0000;
 /// A block component starts with an 8 byte entry count, 0 means a block marker follows.
 const ENTRY_COUNT_SIZE: usize = 8;
-/// Marker header after the zero count: version (2), variant (1), data length (2).
+/// End of the marker header, which follows the zero count as version (2), variant (1) and data length (2).
 const MARKER_HEADER_END: usize = ENTRY_COUNT_SIZE + 5;
 
-/// The block bytes inside a data shard: after the 88 byte headers, up to the `size` field.
+/// Returns the block bytes inside a data shard, from the end of the 88 byte headers up to the `size` field.
 pub fn data_payload(shard: &[u8]) -> Result<&[u8]> {
-    // size field: packet bytes 86..88, so shard bytes 22..24
+    // the size field is packet bytes 86..88, which is shard bytes 22..24
     let size_range = wire::DATA_SIZE.start - SHARD_START..wire::DATA_SIZE.end - SHARD_START;
     let expected = size_range.end;
     let size_bytes = shard.get(size_range).ok_or(Error::TooShort {
@@ -41,7 +41,7 @@ pub fn data_payload(shard: &[u8]) -> Result<&[u8]> {
     Ok(&shard[start..end])
 }
 
-/// The flags byte of a data shard: packet byte 85, shard byte 21.
+/// Reads the flags byte of a data shard, packet byte 85 or shard byte 21.
 fn flags(shard: &[u8]) -> Result<u8> {
     let at = wire::FLAGS - SHARD_START;
     shard.get(at).copied().ok_or(Error::TooShort {
@@ -96,7 +96,7 @@ pub struct Entry {
 #[derive(Debug)]
 pub enum Component {
     Entries(Vec<Entry>),
-    /// Raw block marker: variant 0 footer, 1 header, 2 update parent, 3 genesis certificate.
+    /// Raw block marker. Variant 0 is the footer, 1 the header, 2 update parent, 3 genesis certificate.
     Marker {
         version: u16,
         variant: u8,
@@ -172,11 +172,11 @@ mod tests {
             .collect()
     }
 
-    // Data payload: the block bytes inside a data shard, after the 88 byte headers and up to `size`.
+    // data_payload returns the block bytes after the 88 byte headers, up to `size`
 
     #[test]
     fn test_payload_real() {
-        // shred 0 has size 142, so 54 bytes of block data: the block header marker
+        // shred 0 has size 142, so it carries 54 bytes, the block header marker
         let p = data_payload(shard(0)).unwrap();
         assert_eq!(p.len(), 142 - 88);
         assert_eq!(p[..8], [0u8; 8]);
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_payload_empty() {
-        // shred 1 has size 88: headers only, no block data (padding up to a full FEC set)
+        // shred 1 has size 88, headers only, padding up to a full FEC set
         assert!(data_payload(shard(1)).unwrap().is_empty());
     }
 
@@ -212,13 +212,13 @@ mod tests {
         ));
     }
 
-    // Flags: 0b0100_0000 ends a batch, 0b1100_0000 is the last shred of the slot.
+    // flag 0b0100_0000 ends a batch, 0b1100_0000 marks the last shred of the slot
     #[test]
     fn test_flags_real() {
         assert!(!is_batch_end(shard(0)).unwrap());
         assert!(is_batch_end(shard(31)).unwrap());
         assert!(!is_last_in_slot(shard(31)).unwrap());
-        // 0x7f: batch end plus a reference tick of 63 in the low bits
+        // 0x7f is batch end plus a reference tick of 63 in the low bits
         assert!(is_batch_end(shard(95)).unwrap());
         assert!(!is_last_in_slot(shard(95)).unwrap());
         // 0xff on the resigned last shred
@@ -226,7 +226,7 @@ mod tests {
         assert!(is_last_in_slot(shard(127)).unwrap());
     }
 
-    // Batcher: joins payloads until a batch end flag, then hands the batch over.
+    // Batcher joins payloads until a batch end flag, then hands the batch over
     #[test]
     fn test_batcher_splits_slot() {
         let mut batcher = Batcher::new();
@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(batches()[0], joined);
     }
 
-    // Components: entry count above 0 is an entry batch, 0 is a block marker.
+    // entry count above 0 is an entry batch, 0 is a block marker
     #[test]
     fn test_first_batch_is_header_marker() {
         match decode_component(&batches()[0]).unwrap() {

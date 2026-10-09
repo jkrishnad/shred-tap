@@ -1,4 +1,4 @@
-//! Turns raw shred bytes into a checked Shred: what kind it is and where it sits in its FEC set.
+//! Turns raw shred bytes into a checked Shred, what kind it is and where it sits in its FEC set.
 
 use crate::error::{Error, Result};
 use crate::wire;
@@ -19,13 +19,13 @@ pub enum Kind {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Variant {
     pub kind: Kind,
-    /// Number of 20 byte Merkle proof entries in the tail, 6 for a 32:32 set.
+    /// Number of 20 byte Merkle proof entries in the tail, 6 for a 32 data and 32 coding set.
     pub proof_size: u8,
-    /// Last FEC set of a slot: the tail has an extra 64 byte retransmitter signature.
+    /// Last FEC set of a slot, the tail has an extra 64 byte retransmitter signature.
     pub resigned: bool,
 }
 
-/// Splits the variant byte: high 4 bits are the type, low 4 bits the proof size.
+/// Splits the variant byte into the type (high 4 bits) and the proof size (low 4 bits).
 pub fn parse_variant(v: u8) -> Result<Variant> {
     // >> 4 drops the proof size so every 0x9_ byte matches 0x9, and so on.
     // Agave builds the byte as proof_size | 0x60, 0x70, 0x90 or 0xB0.
@@ -56,7 +56,7 @@ pub fn parse_variant(v: u8) -> Result<Variant> {
     }
 }
 
-/// Slot of this shred's shard in the Reed-Solomon batch: data at 0..num_data, coding right after.
+/// Place of this shred's shard in the Reed-Solomon batch, data at 0..num_data and coding right after.
 pub fn shard_index(b: &[u8]) -> Result<usize> {
     match parse_variant(wire::variant(b)?)?.kind {
         Kind::Data => {
@@ -132,13 +132,13 @@ impl Shred {
         })
     }
 
-    /// Key that groups shreds into FEC sets: every shred of one set shares it.
+    /// Key that groups shreds into FEC sets, every shred of one set shares it.
     pub fn fec_key(&self) -> (u64, u32) {
         (self.slot, self.fec_set_index)
     }
 }
 
-/// Byte ranges of a shred's parts: shard first, then the Merkle tail.
+/// Byte ranges of a shred's parts, the shard first and then the Merkle tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     /// Bytes Reed-Solomon protects, same length for data and coding shreds of a set.
@@ -151,7 +151,7 @@ pub struct Layout {
     pub retransmitter_signature: Option<Range<usize>>,
 }
 
-/// Works out where each part sits, from Agave merkle.rs: the payload size is fixed,
+/// Works out where each part sits, following Agave merkle.rs. The payload size is fixed,
 /// so a longer tail leaves less room for the shard.
 pub fn layout(variant: Variant) -> Result<Layout> {
     // Data shards include their headers, so they start right after the signature.
@@ -200,8 +200,8 @@ mod tests {
     use crate::error::Error;
     use crate::wire::tests::{REAL_CODE, REAL_DATA};
 
-    // Variant byte: high 4 bits are the type, low 4 bits the Merkle proof size.
-    // From Agave shred.rs: 0x60 code, 0x70 code resigned, 0x90 data, 0xB0 data resigned.
+    // high 4 bits of the variant byte are the type, low 4 bits the Merkle proof size
+    // Agave shred.rs uses 0x60 code, 0x70 code resigned, 0x90 data, 0xB0 data resigned
     #[test]
     fn test_variant_data() {
         let v = parse_variant(0x96).unwrap();
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_variant_unknown() {
-        // the stray packet from the first capture
+        // not a shred type
         assert!(matches!(
             parse_variant(0x19),
             Err(Error::UnknownVariant(0x19))
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(v.proof_size, 3);
     }
 
-    // Shard index: the shred's slot inside its FEC set, 0..64.
+    // shard index is the shred's place inside its FEC set, 0..64
     // Data shreds fill 0..num_data, coding shreds come after them.
     #[test]
     fn test_shard_index_real_data() {
@@ -405,11 +405,11 @@ mod tests {
         ));
     }
 
-    // layout: byte ranges of the shard and the tail, from Agave merkle.rs.
-    // Tail order: chained Merkle root (32), proof (proof_size * 20), retransmitter signature (64, resigned only).
+    // layout gives byte ranges of the shard and the tail, following Agave merkle.rs
+    // the tail is chained Merkle root (32), proof (proof_size * 20), retransmitter signature (64, resigned only)
     // capacity = payload size - headers - tail, shard = start..headers + capacity.
 
-    // Full real shreds from real-10s.pcap: data (0x96), coding (0x66) of the same FEC set,
+    // Full real shreds from real-10s.pcap, data (0x96) and coding (0x66) of the same FEC set,
     // then a resigned data shred (0xB6). Shred bytes only, no IP addresses.
     const FULL: &[u8] = include_bytes!("../tests/fixtures/real-shreds.bin");
     const FULL_DATA: std::ops::Range<usize> = 0..1203;

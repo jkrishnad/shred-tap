@@ -10,15 +10,15 @@ pub const DATA_SHREDS: usize = 32;
 pub const CODING_SHREDS: usize = 32;
 pub const TOTAL_SHREDS: usize = DATA_SHREDS + CODING_SHREDS;
 
-/// One FEC set as it fills up: 64 places, data shards at 0..32, coding at 32..64.
+/// One FEC set as it fills up, with 64 places, data shards at 0..32 and coding at 32..64.
 pub struct FecSet {
     pub slot: u64,
     pub fec_set_index: u32,
     /// Shard bytes by shard index. None means not arrived (yet).
     shards: Vec<Option<Vec<u8>>>,
-    /// t0: when the first shred of this set arrived.
+    /// When the first shred of this set arrived (t0).
     pub first_seen_ns: Option<u64>,
-    /// t1: when the 32nd unique shred arrived, the moment the set became rebuildable.
+    /// When the 32nd unique shred arrived, the moment the set became rebuildable (t1).
     pub decodable_ns: Option<u64>,
     /// True if Reed-Solomon had to rebuild missing data shards.
     pub recovered: bool,
@@ -45,8 +45,8 @@ impl FecSet {
             });
         }
 
-        // config first: a coding shred's shard index is num_data + position, so it is only
-        // meaningful once num_data is known to be 32
+        // check the config first, a coding shred's shard index is num_data + position,
+        // so it only means something once num_data is known to be 32
         if shred.variant.kind == Kind::Code {
             let num_data = wire::num_data(&shred.bytes)?;
             let num_coding = wire::num_coding(&shred.bytes)?;
@@ -121,7 +121,7 @@ impl FecSet {
         if !self.can_recover() {
             return Err(self.too_few());
         }
-        // built per call, which is cheap next to the shards: only about one set in six needs it
+        // built per call rather than once in a static, so nothing here can panic
         let rs = ReedSolomon::new(DATA_SHREDS, CODING_SHREDS)?;
         // fills the None data slots in place, coding slots are left as they are
         rs.reconstruct_data(&mut self.shards)?;
@@ -151,7 +151,7 @@ mod tests {
     use crate::error::Error;
     use crate::shred::Shred;
 
-    // One complete real FEC set from real-10s.pcap: slot 449661784, fec_set_index 96.
+    // One complete real FEC set from real-10s.pcap, slot 449661784, fec_set_index 96.
     // 32 data shreds (1203 bytes) then 32 coding shreds (1228 bytes), in shard index order.
     const SET: &[u8] = include_bytes!("../tests/fixtures/real-fec-set.bin");
 
@@ -173,7 +173,7 @@ mod tests {
         FecSet::new(449_661_784, 96)
     }
 
-    // original data shard bytes, to compare recovery against (layout: 64..1051)
+    // original data shard bytes at 64..1051, to compare recovery against
     fn original_data_shard(shard_index: usize) -> &'static [u8] {
         &raw(shard_index)[64..1051]
     }
@@ -218,7 +218,6 @@ mod tests {
 
     #[test]
     fn test_duplicate_is_ignored() {
-        // the first capture had 24 duplicates in 10 seconds
         let mut set = new_set();
         assert!(set.push(shred(5)).unwrap());
         assert!(!set.push(shred(5)).unwrap());
@@ -277,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_recover_from_coding_only() {
-        // worst case: every data shred lost, all 32 rebuilt from parity
+        // every data shred lost, all 32 rebuilt from parity
         let mut set = new_set();
         for i in 32..64 {
             set.push(shred(i)).unwrap();
@@ -310,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_unsupported_erasure_config() {
-        // Agave only recovers 32:32 sets, so we only accept those
+        // Agave only recovers 32 data and 32 coding sets, so we only accept those
         let mut bytes = raw(40).to_vec();
         bytes[83..85].copy_from_slice(&16u16.to_le_bytes());
         let s = Shred::parse(&bytes, 0).unwrap();

@@ -65,7 +65,7 @@ pub fn slot(bytes: &[u8]) -> Result<u64> {
     Ok(slot)
 }
 
-/// Raw variant byte: shred type
+/// Raw variant byte, shred type in the high 4 bits and Merkle proof size in the low 4.
 pub fn variant(bytes: &[u8]) -> Result<u8> {
     let variant = bytes.get(VARIANT).copied().ok_or(Error::TooShort {
         expected: VARIANT + 1,
@@ -93,13 +93,13 @@ pub fn fec_set_index(bytes: &[u8]) -> Result<u32> {
     Ok(fec_set_index)
 }
 
-/// Data shred: how many slots back the parent slot is.
+/// How many slots back the parent slot is (data shreds).
 pub fn parent_offset(bytes: &[u8]) -> Result<u16> {
     let parent_offset = read_u16(bytes, PARENT_OFFSET)?;
     Ok(parent_offset)
 }
 
-/// Data shred: reference tick and the batch complete / last in slot bits.
+/// Reference tick plus the batch complete and last in slot bits (data shreds).
 pub fn flags(bytes: &[u8]) -> Result<u8> {
     let flags = bytes.get(FLAGS).copied().ok_or(Error::TooShort {
         expected: FLAGS + 1,
@@ -108,25 +108,25 @@ pub fn flags(bytes: &[u8]) -> Result<u8> {
     Ok(flags)
 }
 
-/// Data shred: end of the block data, counted from byte 0 (headers included).
+/// End of the block data, counted from byte 0 with headers included (data shreds).
 pub fn data_size(bytes: &[u8]) -> Result<u16> {
     let data_size = read_u16(bytes, DATA_SIZE)?;
     Ok(data_size)
 }
 
-/// Coding shred: number of data shreds in the FEC set.
+/// Number of data shreds in the FEC set (coding shreds).
 pub fn num_data(bytes: &[u8]) -> Result<u16> {
     let num_data = read_u16(bytes, NUM_DATA)?;
     Ok(num_data)
 }
 
-/// Coding shred: number of coding shreds in the FEC set.
+/// Number of coding shreds in the FEC set (coding shreds).
 pub fn num_coding(bytes: &[u8]) -> Result<u16> {
     let num_coding = read_u16(bytes, NUM_CODING)?;
     Ok(num_coding)
 }
 
-/// Coding shred: its place among the coding shreds of the set.
+/// Its place among the coding shreds of the set (coding shreds).
 pub fn position(bytes: &[u8]) -> Result<u16> {
     let position = read_u16(bytes, POSITION)?;
     Ok(position)

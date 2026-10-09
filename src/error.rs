@@ -24,7 +24,7 @@ pub enum Error {
         expected: (u64, u32),
         got: (u64, u32),
     },
-    /// Shard index outside the place its kind may take in a 32:32 set.
+    /// Shard index outside the range its kind may use in a 32 data and 32 coding set.
     #[error("shard index {0} out of range for its kind")]
     ShardIndexOutOfRange(usize),
     /// Coding shred for a set that is not 32 data + 32 coding.
