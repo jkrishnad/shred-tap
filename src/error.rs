@@ -15,4 +15,7 @@ pub enum Error {
     /// Data shred whose index is below its FEC set start, so the packet is junk.
     #[error("data shred index {index} is below its fec_set_index {fec_set_index}")]
     IndexBelowFecSet { index: u32, fec_set_index: u32 },
+    /// Merkle proof too long to fit in the shred, so the variant byte is junk.
+    #[error("invalid proof size: {0}")]
+    InvalidProofSize(u8),
 }

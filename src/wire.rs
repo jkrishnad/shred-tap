@@ -17,12 +17,14 @@ pub const PARENT_OFFSET: Range<usize> = 83..85;
 pub const FLAGS: usize = 85;
 pub const DATA_SIZE: Range<usize> = 86..88;
 pub const DATA_HEADER_SIZE: usize = 88;
+pub const DATA_PAYLOAD_SIZE: usize = 1203;
 
 // Coding header
 pub const NUM_DATA: Range<usize> = 83..85;
 pub const NUM_CODING: Range<usize> = 85..87;
 pub const POSITION: Range<usize> = 87..89;
 pub const CODING_HEADER_SIZE: usize = 89;
+pub const CODING_PAYLOAD_SIZE: usize = 1228;
 
 /// Returns the bytes in `range`, or TooShort if the packet ends before it.
 fn read_bytes(bytes: &[u8], range: Range<usize>) -> Result<&[u8]> {
