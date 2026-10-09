@@ -36,4 +36,10 @@ pub enum Error {
     /// Reed-Solomon failed, for example shards of different lengths.
     #[error("reed-solomon recovery failed: {0}")]
     Recovery(#[from] reed_solomon_erasure::Error),
+    /// Data shred whose size field points before its headers end or past its shard.
+    #[error("invalid data size {size} for a shard of {shard_len} bytes")]
+    InvalidDataSize { size: u16, shard_len: usize },
+    /// Entry batch bytes that don't decode as entries.
+    #[error("entry decode failed: {0}")]
+    Decode(#[from] wincode::ReadError),
 }
