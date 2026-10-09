@@ -1,3 +1,4 @@
+pub mod assembler;
 pub mod block;
 pub mod error;
 pub mod fec;
