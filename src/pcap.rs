@@ -34,6 +34,8 @@ pub struct Record {
 pub struct PcapReader<R> {
     reader: R,
     nanos: bool,
+    /// Longest frame the capture may hold, from the file header.
+    snaplen: usize,
 }
 
 impl<R: Read> PcapReader<R> {
@@ -56,12 +58,17 @@ impl<R: Read> PcapReader<R> {
             }
         };
 
+        let snaplen = le_u32(&header[16..20]) as usize;
         let linktype = le_u32(&header[20..24]);
         if linktype != LINKTYPE_ETHERNET {
             return Err(Error::UnsupportedLinkType(linktype));
         }
 
-        Ok(Self { reader, nanos })
+        Ok(Self {
+            reader,
+            nanos,
+            snaplen,
+        })
     }
 
     /// Next record, or None at a clean end of the file.
@@ -76,6 +83,13 @@ impl<R: Read> PcapReader<R> {
         let seconds = u64::from(le_u32(&header[0..4]));
         let fraction = u64::from(le_u32(&header[4..8]));
         let captured_len = le_u32(&header[8..12]) as usize;
+        // a corrupt length must become an error, not a huge allocation
+        if captured_len > self.snaplen {
+            return Err(Error::PcapRecordTooLarge {
+                len: captured_len,
+                snaplen: self.snaplen,
+            });
+        }
 
         let mut frame = vec![0u8; captured_len];
         if read_full(&mut self.reader, &mut frame)? < captured_len {
@@ -266,6 +280,22 @@ mod tests {
         file.truncate(24 + 16 + 10);
         let mut r = PcapReader::new(&file[..]).unwrap();
         assert!(matches!(r.next_record(), Err(Error::TruncatedPcap)));
+    }
+
+    #[test]
+    fn test_record_longer_than_snaplen() {
+        // a corrupt length field, the reader must refuse it before allocating
+        let a = udp_frame(b"x", 0);
+        let mut file = pcap_file(MAGIC_NANOS, LINKTYPE_ETHERNET, &[(1, 0, &a)]);
+        file[24 + 8..24 + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut r = PcapReader::new(&file[..]).unwrap();
+        assert!(matches!(
+            r.next_record(),
+            Err(Error::PcapRecordTooLarge {
+                snaplen: 65535,
+                ..
+            })
+        ));
     }
 
     #[test]

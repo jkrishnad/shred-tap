@@ -55,6 +55,9 @@ pub enum Error {
     /// Capture ends in the middle of a header or a frame.
     #[error("pcap file is truncated")]
     TruncatedPcap,
+    /// Record longer than the capture's snaplen, so its length field is corrupt.
+    #[error("pcap record of {len} bytes is longer than the snaplen {snaplen}")]
+    PcapRecordTooLarge { len: usize, snaplen: usize },
     /// Reading the capture failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
