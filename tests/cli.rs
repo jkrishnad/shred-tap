@@ -60,6 +60,11 @@ fn check_output(out: &Path) {
     let markers = std::fs::read_to_string(out.join("markers.jsonl")).unwrap();
     assert_eq!(markers.lines().count(), 2);
 
+    let slots = std::fs::read_to_string(out.join("slots.jsonl")).unwrap();
+    assert_eq!(slots.lines().count(), 1);
+    assert!(slots.contains(r#""txs":26"#), "{slots}");
+    assert!(slots.contains(r#""end":"complete""#), "{slots}");
+
     let summary = std::fs::read_to_string(out.join("summary.json")).unwrap();
     assert!(summary.contains(r#""packets": 255"#), "{summary}");
     assert!(summary.contains(r#""txs": 26"#), "{summary}");

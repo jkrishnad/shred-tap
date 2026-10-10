@@ -77,6 +77,31 @@ pub enum Event {
         /// False when the set was given up on.
         decoded: bool,
     },
+    /// One slot, once it is closed. Comes after every other event of the slot.
+    Slot {
+        slot: u64,
+        /// First shred of any of its sets arrived.
+        first_shred_ns: u64,
+        /// The last batch of the slot decoded, None if nothing decoded.
+        done_ns: Option<u64>,
+        sets_decoded: u32,
+        sets_lost: u32,
+        txs: u64,
+        /// The block footer was decoded.
+        footer: bool,
+        end: SlotEnd,
+    },
+}
+
+/// Why a slot was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotEnd {
+    /// Its last shred was decoded.
+    Complete,
+    /// Its skip deadline passed, or a set could not be rebuilt.
+    GivenUp,
+    /// The input ended while it was still open.
+    EndOfInput,
 }
 
 /// Shred health counters for the report.
@@ -117,6 +142,13 @@ struct SlotState {
     /// because a batch can start in one set and end in the next.
     next_set: u32,
     batcher: Batcher,
+    sets_decoded: u32,
+    /// Sets that failed to rebuild, the ones still waiting are added when the slot closes.
+    sets_lost: u32,
+    txs: u64,
+    footer: bool,
+    /// When the slot's latest batch decoded.
+    done_ns: Option<u64>,
 }
 
 pub struct Assembler {
@@ -182,6 +214,11 @@ impl Assembler {
             sets: BTreeMap::new(),
             next_set: 0,
             batcher: Batcher::new(),
+            sets_decoded: 0,
+            sets_lost: 0,
+            txs: 0,
+            footer: false,
+            done_ns: None,
         });
         state.first_seen_ns = state.first_seen_ns.min(recv_ns);
         if shred.fec_set_index < state.next_set {
@@ -214,6 +251,7 @@ impl Assembler {
     fn drain(&mut self, slot: u64, now_ns: u64) -> Vec<Event> {
         let mut events = Vec::new();
         let mut slot_done = false;
+        let mut end = SlotEnd::GivenUp;
 
         let Some(state) = self.slots.get_mut(&slot) else {
             return events;
@@ -232,12 +270,14 @@ impl Assembler {
             let data_at_decode = set.data_received() as u64;
             if set.recover().is_err() {
                 self.stats.sets_lost += 1;
+                state.sets_lost += 1;
                 events.push(set_event(&set, data_at_decode, false));
                 // later sets can't be decoded without this one's bytes
                 slot_done = true;
                 break;
             }
             self.stats.sets_decoded += 1;
+            state.sets_decoded += 1;
             if set.recovered {
                 self.stats.sets_recovered += 1;
             }
@@ -252,6 +292,7 @@ impl Assembler {
 
             let Ok(shards) = set.data_shards() else {
                 self.stats.sets_lost += 1;
+                state.sets_lost += 1;
                 slot_done = true;
                 break;
             };
@@ -267,13 +308,23 @@ impl Assembler {
                 self.stats.batches += 1;
                 match decode_component(&batch) {
                     Ok(component) => {
-                        push_events(&mut events, &mut self.stats, slot, component, timing)
+                        let before = events.len();
+                        push_events(&mut events, &mut self.stats, slot, component, timing);
+                        for event in &events[before..] {
+                            match event {
+                                Event::Tx { .. } => state.txs += 1,
+                                Event::Marker { variant: 0, .. } => state.footer = true,
+                                _ => {}
+                            }
+                        }
+                        state.done_ns = Some(now_ns);
                     }
                     Err(_) => self.stats.decode_errors += 1,
                 }
                 if is_last_in_slot(shard).unwrap_or(false) {
                     self.stats.slots_complete += 1;
                     slot_done = true;
+                    end = SlotEnd::Complete;
                 }
             }
             if slot_done {
@@ -282,7 +333,7 @@ impl Assembler {
         }
 
         if slot_done {
-            events.extend(self.close(slot));
+            events.extend(self.close(slot, end));
         }
         events
     }
@@ -299,13 +350,13 @@ impl Assembler {
         expired.sort_unstable();
         let mut events = Vec::new();
         for slot in expired {
-            events.extend(self.close(slot));
+            events.extend(self.close(slot, SlotEnd::GivenUp));
         }
         events
     }
 
-    /// Drops a slot's state. Every set it never decoded is counted and handed out as lost.
-    fn close(&mut self, slot: u64) -> Vec<Event> {
+    /// Drops a slot's state. Every set it never decoded is handed out as lost, then the slot itself.
+    fn close(&mut self, slot: u64, end: SlotEnd) -> Vec<Event> {
         self.closed.insert(slot);
         // forget the oldest slots first, a junk slot number only takes one place
         while self.closed.len() > CLOSED_SLOTS_KEPT {
@@ -315,11 +366,22 @@ impl Assembler {
             return Vec::new();
         };
         self.stats.sets_lost += state.sets.len() as u64;
-        state
+        let mut events: Vec<Event> = state
             .sets
             .values()
             .map(|set| set_event(set, set.data_received() as u64, false))
-            .collect()
+            .collect();
+        events.push(Event::Slot {
+            slot,
+            first_shred_ns: state.first_seen_ns,
+            done_ns: state.done_ns,
+            sets_decoded: state.sets_decoded,
+            sets_lost: state.sets_lost + state.sets.len() as u32,
+            txs: state.txs,
+            footer: state.footer,
+            end,
+        });
+        events
     }
 
     /// End of input. Every set still waiting is given up on, and handed out as lost.
@@ -328,7 +390,7 @@ impl Assembler {
         slots.sort_unstable();
         let mut events = Vec::new();
         for slot in slots {
-            events.extend(self.close(slot));
+            events.extend(self.close(slot, SlotEnd::EndOfInput));
         }
         events
     }
@@ -734,7 +796,8 @@ mod tests {
             .filter(|(_, p)| wire::fec_set_index(p).unwrap() != 0)
             .collect();
         let (mut asm, _) = run(&packets);
-        let lost = asm.finish();
+        let events = asm.finish();
+        let lost = set_events(&events);
         assert_eq!(lost.len(), 3);
         for e in lost {
             let Event::Set {
@@ -743,12 +806,73 @@ mod tests {
                 ..
             } = e
             else {
-                panic!("finish should only hand out set events");
+                unreachable!()
             };
             assert!(!decoded);
             // these sets had 32 shreds but waited behind set 0, which never came
             assert!(decodable_ns.is_some());
         }
+        // then the slot itself, last
+        assert!(matches!(
+            events.last(),
+            Some(Event::Slot {
+                sets_decoded: 0,
+                sets_lost: 3,
+                end: SlotEnd::EndOfInput,
+                ..
+            })
+        ));
+    }
+
+    // Slot events, one per slot when it closes
+
+    #[test]
+    fn test_slot_event_complete() {
+        let (_, events) = run(&arrivals());
+        let slots: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Slot { .. }))
+            .collect();
+        assert_eq!(slots.len(), 1);
+        let Event::Slot {
+            slot,
+            first_shred_ns,
+            done_ns,
+            sets_decoded,
+            sets_lost,
+            txs,
+            footer,
+            end,
+        } = slots[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*slot, SLOT);
+        assert_eq!(*first_shred_ns, arrivals()[0].0);
+        assert!(done_ns.unwrap() > *first_shred_ns);
+        assert_eq!((*sets_decoded, *sets_lost, *txs), (4, 0, 26));
+        assert!(*footer);
+        assert_eq!(*end, SlotEnd::Complete);
+        // it closes the slot, so it is the last event
+        assert!(matches!(events.last(), Some(Event::Slot { .. })));
+    }
+
+    #[test]
+    fn test_slot_event_given_up() {
+        let packets = half_set_0();
+        let first = packets.iter().map(|(t, _)| *t).min().unwrap();
+        let (mut asm, _) = run(&packets);
+        let events = tick(&mut asm, first + 1_460_000_000);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Slot {
+                slot: SLOT,
+                done_ns: None,
+                sets_lost: 1,
+                end: SlotEnd::GivenUp,
+                ..
+            }
+        )));
     }
 
     #[test]

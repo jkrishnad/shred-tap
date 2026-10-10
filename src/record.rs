@@ -1,7 +1,8 @@
 //! Writes the assembler's events as JSON lines, one file per kind, and the run's totals as a summary.
 //!
 //! Every event becomes one small record, a flat struct whose fields serde writes in order.
-//! Transactions go to tx.jsonl, block markers to markers.jsonl and FEC sets to sets.jsonl.
+//! Transactions go to tx.jsonl, block markers to markers.jsonl, FEC sets to sets.jsonl
+//! and one line per slot to slots.jsonl.
 //! Output is generic over the writer, files on disk for a real run and Vec<u8> in tests.
 //! write_summary writes the Stats once at the end as pretty JSON.
 
@@ -11,7 +12,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::assembler::{Event, Stats, Timing};
+use crate::assembler::{Event, SlotEnd, Stats, Timing};
 use crate::error::Result;
 
 /// One line of tx.jsonl, keyed by the transaction's first signature.
@@ -49,16 +50,36 @@ struct SetRecord {
     decoded: bool,
 }
 
+/// One line of slots.jsonl, written when the slot closes.
+#[derive(Serialize)]
+struct SlotRecord {
+    slot: u64,
+    first_shred_ns: u64,
+    /// When the last batch decoded, null if nothing did.
+    done_ns: Option<u64>,
+    sets_decoded: u32,
+    sets_lost: u32,
+    txs: u64,
+    footer: bool,
+    end: &'static str,
+}
+
 /// Where events are written. W is any writer, files on disk or a Vec<u8> in tests.
 pub struct Output<W> {
     pub tx: W,
     pub markers: W,
     pub sets: W,
+    pub slots: W,
 }
 
 impl<W: Write> Output<W> {
-    pub fn new(tx: W, markers: W, sets: W) -> Self {
-        Self { tx, markers, sets }
+    pub fn new(tx: W, markers: W, sets: W, slots: W) -> Self {
+        Self {
+            tx,
+            markers,
+            sets,
+            slots,
+        }
     }
 
     /// Writes one event as one line in the file for its kind.
@@ -122,6 +143,32 @@ impl<W: Write> Output<W> {
                 };
                 write_line(&mut self.sets, &record)
             }
+            Event::Slot {
+                slot,
+                first_shred_ns,
+                done_ns,
+                sets_decoded,
+                sets_lost,
+                txs,
+                footer,
+                end,
+            } => {
+                let record = SlotRecord {
+                    slot: *slot,
+                    first_shred_ns: *first_shred_ns,
+                    done_ns: *done_ns,
+                    sets_decoded: *sets_decoded,
+                    sets_lost: *sets_lost,
+                    txs: *txs,
+                    footer: *footer,
+                    end: match end {
+                        SlotEnd::Complete => "complete",
+                        SlotEnd::GivenUp => "given_up",
+                        SlotEnd::EndOfInput => "end_of_input",
+                    },
+                };
+                write_line(&mut self.slots, &record)
+            }
         }
     }
 
@@ -130,13 +177,14 @@ impl<W: Write> Output<W> {
         self.tx.flush()?;
         self.markers.flush()?;
         self.sets.flush()?;
+        self.slots.flush()?;
         Ok(())
     }
 }
 
 /// Files on disk, the one concrete writer a real run uses.
 impl Output<BufWriter<File>> {
-    /// Creates the folder if needed and the three files inside it, replacing old ones.
+    /// Creates the folder if needed and the four files inside it, replacing old ones.
     pub fn create(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let open = |name: &str| -> Result<BufWriter<File>> {
@@ -146,6 +194,7 @@ impl Output<BufWriter<File>> {
             open("tx.jsonl")?,
             open("markers.jsonl")?,
             open("sets.jsonl")?,
+            open("slots.jsonl")?,
         ))
     }
 }
@@ -184,7 +233,7 @@ mod tests {
     }
 
     fn memory_output() -> Output<Vec<u8>> {
-        Output::new(Vec::new(), Vec::new(), Vec::new())
+        Output::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
     }
 
     fn lines(buf: &[u8]) -> Vec<String> {
@@ -268,6 +317,41 @@ mod tests {
     }
 
     #[test]
+    fn test_slot_lines() {
+        let mut out = memory_output();
+        out.write(&Event::Slot {
+            slot: 449_661_788,
+            first_shred_ns: 100,
+            done_ns: Some(300),
+            sets_decoded: 4,
+            sets_lost: 0,
+            txs: 26,
+            footer: true,
+            end: SlotEnd::Complete,
+        })
+        .unwrap();
+        out.write(&Event::Slot {
+            slot: 449_661_789,
+            first_shred_ns: 120,
+            done_ns: None,
+            sets_decoded: 0,
+            sets_lost: 2,
+            txs: 0,
+            footer: false,
+            end: SlotEnd::GivenUp,
+        })
+        .unwrap();
+        assert_eq!(
+            lines(&out.slots),
+            [
+                r#"{"slot":449661788,"first_shred_ns":100,"done_ns":300,"sets_decoded":4,"sets_lost":0,"txs":26,"footer":true,"end":"complete"}"#,
+                r#"{"slot":449661789,"first_shred_ns":120,"done_ns":null,"sets_decoded":0,"sets_lost":2,"txs":0,"footer":false,"end":"given_up"}"#,
+            ]
+        );
+        assert!(out.tx.is_empty());
+    }
+
+    #[test]
     fn test_one_line_per_event() {
         let mut out = memory_output();
         for _ in 0..3 {
@@ -311,7 +395,7 @@ mod tests {
         })
         .unwrap();
         out.flush().unwrap();
-        for name in ["tx.jsonl", "markers.jsonl", "sets.jsonl"] {
+        for name in ["tx.jsonl", "markers.jsonl", "sets.jsonl", "slots.jsonl"] {
             assert!(dir.join(name).exists(), "{name}");
         }
         let tx = std::fs::read_to_string(dir.join("tx.jsonl")).unwrap();
