@@ -46,6 +46,21 @@ pub enum Event {
         data: Vec<u8>,
         timing: Timing,
     },
+    /// One FEC set, either decoded or given up on. Comes before anything decoded from it.
+    Set {
+        slot: u64,
+        fec_set_index: u32,
+        /// First shred of the set arrived (t0).
+        first_shred_ns: u64,
+        /// The set reached 32 shreds (t1), None if it never did.
+        decodable_ns: Option<u64>,
+        /// Data shreds the set held when it was decoded or given up on.
+        data_at_decode: u64,
+        /// Reed-Solomon rebuilt missing data shards.
+        recovered: bool,
+        /// False when the set was given up on.
+        decoded: bool,
+    },
 }
 
 /// Shred health counters for the report.
@@ -71,6 +86,10 @@ pub struct Stats {
     /// Batches that didn't decode as entries or a marker.
     pub decode_errors: u64,
     pub slots_complete: u64,
+    /// Transactions handed out, one per first signature.
+    pub txs: u64,
+    /// Block markers handed out.
+    pub markers: u64,
 }
 
 /// Everything in flight for one slot.
@@ -113,16 +132,17 @@ impl Assembler {
             return Vec::new();
         }
 
+        let mut events = Vec::new();
         if slot > self.newest_slot {
             self.newest_slot = slot;
-            self.evict_old_slots();
+            events.extend(self.evict_old_slots());
         }
 
         let state = self.slots.entry(slot).or_default();
         if shred.fec_set_index < state.next_set {
             // its set was already decoded, the shred is no longer needed
             self.stats.after_decode += 1;
-            return Vec::new();
+            return events;
         }
 
         let set = state
@@ -133,15 +153,16 @@ impl Assembler {
             Ok(true) => {}
             Ok(false) => {
                 self.stats.duplicates += 1;
-                return Vec::new();
+                return events;
             }
             Err(_) => {
                 self.stats.rejected += 1;
-                return Vec::new();
+                return events;
             }
         }
 
-        self.drain(slot, recv_ns)
+        events.extend(self.drain(slot, recv_ns));
+        events
     }
 
     /// Hands every rebuildable set, in order, to the slot's batcher and decodes finished batches.
@@ -162,8 +183,11 @@ impl Assembler {
             };
             state.next_set += DATA_SHREDS as u32;
 
+            // counted before recover, which fills the missing data places
+            let data_at_decode = set.data_received() as u64;
             if set.recover().is_err() {
                 self.stats.sets_lost += 1;
+                events.push(set_event(&set, data_at_decode, false));
                 // later sets can't be decoded without this one's bytes
                 slot_done = true;
                 break;
@@ -172,6 +196,7 @@ impl Assembler {
             if set.recovered {
                 self.stats.sets_recovered += 1;
             }
+            events.push(set_event(&set, data_at_decode, true));
 
             let timing = Timing {
                 fec_set_index: set.fec_set_index,
@@ -196,7 +221,9 @@ impl Assembler {
                 };
                 self.stats.batches += 1;
                 match decode_component(&batch) {
-                    Ok(component) => push_events(&mut events, slot, component, timing),
+                    Ok(component) => {
+                        push_events(&mut events, &mut self.stats, slot, component, timing)
+                    }
                     Err(_) => self.stats.decode_errors += 1,
                 }
                 if is_last_in_slot(shard).unwrap_or(false) {
@@ -210,37 +237,46 @@ impl Assembler {
         }
 
         if slot_done {
-            self.close(slot);
+            events.extend(self.close(slot));
         }
         events
     }
 
     /// Gives up on slots too far behind the newest one.
-    fn evict_old_slots(&mut self) {
+    fn evict_old_slots(&mut self) -> Vec<Event> {
         let cutoff = self.newest_slot.saturating_sub(MAX_SLOTS_IN_FLIGHT);
         let old: Vec<u64> = self.slots.keys().copied().filter(|s| *s < cutoff).collect();
+        let mut events = Vec::new();
         for slot in old {
-            self.close(slot);
+            events.extend(self.close(slot));
         }
         // slots below the cutoff are refused as too old anyway, so the list stays short
         self.closed = self.closed.split_off(&cutoff);
+        events
     }
 
-    /// Drops a slot's state, counting any set it never decoded as lost.
-    fn close(&mut self, slot: u64) {
-        if let Some(state) = self.slots.remove(&slot) {
-            self.stats.sets_lost += state.sets.len() as u64;
-        }
+    /// Drops a slot's state. Every set it never decoded is counted and handed out as lost.
+    fn close(&mut self, slot: u64) -> Vec<Event> {
         self.closed.insert(slot, ());
+        let Some(state) = self.slots.remove(&slot) else {
+            return Vec::new();
+        };
+        self.stats.sets_lost += state.sets.len() as u64;
+        state
+            .sets
+            .values()
+            .map(|set| set_event(set, set.data_received() as u64, false))
+            .collect()
     }
 
-    /// End of input. Every set still waiting is counted as lost.
-    pub fn finish(&mut self) -> &Stats {
+    /// End of input. Every set still waiting is given up on, and handed out as lost.
+    pub fn finish(&mut self) -> Vec<Event> {
         let slots: Vec<u64> = self.slots.keys().copied().collect();
+        let mut events = Vec::new();
         for slot in slots {
-            self.close(slot);
+            events.extend(self.close(slot));
         }
-        &self.stats
+        events
     }
 
     /// Counters so far.
@@ -259,13 +295,33 @@ fn parse_full_shred(payload: &[u8], recv_ns: u64) -> Option<Shred> {
     (payload.len() == expected).then_some(shred)
 }
 
+/// The Set event for a set, decoded or not.
+fn set_event(set: &FecSet, data_at_decode: u64, decoded: bool) -> Event {
+    Event::Set {
+        slot: set.slot,
+        fec_set_index: set.fec_set_index,
+        first_shred_ns: set.first_seen_ns.unwrap_or(0),
+        decodable_ns: set.decodable_ns,
+        data_at_decode,
+        recovered: set.recovered,
+        decoded,
+    }
+}
+
 /// One event per transaction (by first signature), or one for a marker.
-fn push_events(events: &mut Vec<Event>, slot: u64, component: Component, timing: Timing) {
+fn push_events(
+    events: &mut Vec<Event>,
+    stats: &mut Stats,
+    slot: u64,
+    component: Component,
+    timing: Timing,
+) {
     match component {
         Component::Entries(entries) => {
             for entry in entries {
                 for tx in entry.transactions {
                     if let Some(signature) = tx.signatures.first() {
+                        stats.txs += 1;
                         events.push(Event::Tx {
                             slot,
                             signature: *signature,
@@ -275,12 +331,15 @@ fn push_events(events: &mut Vec<Event>, slot: u64, component: Component, timing:
                 }
             }
         }
-        Component::Marker { variant, data, .. } => events.push(Event::Marker {
-            slot,
-            variant,
-            data,
-            timing,
-        }),
+        Component::Marker { variant, data, .. } => {
+            stats.markers += 1;
+            events.push(Event::Marker {
+                slot,
+                variant,
+                data,
+                timing,
+            });
+        }
     }
 }
 
@@ -330,7 +389,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 Event::Tx { signature, .. } => Some(signature.to_string()),
-                Event::Marker { .. } => None,
+                _ => None,
             })
             .collect()
     }
@@ -340,7 +399,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 Event::Marker { variant, .. } => Some(*variant),
-                Event::Tx { .. } => None,
+                _ => None,
             })
             .collect()
     }
@@ -436,13 +495,16 @@ mod tests {
     fn test_timing() {
         let (_, events) = run(&arrivals());
         for e in &events {
-            let (Event::Tx { timing, .. } | Event::Marker { timing, .. }) = e;
-            assert!(timing.first_shred_ns <= timing.decodable_ns);
-            assert!(timing.decodable_ns <= timing.decoded_ns);
+            if let Event::Tx { timing, .. } | Event::Marker { timing, .. } = e {
+                assert!(timing.first_shred_ns <= timing.decodable_ns);
+                assert!(timing.decodable_ns <= timing.decoded_ns);
+            }
         }
         // the header marker decodes from set 0 alone
-        let Event::Marker { timing, slot, .. } = &events[0] else {
-            panic!("first event should be the header marker");
+        let Some(Event::Marker { timing, slot, .. }) =
+            events.iter().find(|e| matches!(e, Event::Marker { .. }))
+        else {
+            panic!("expected a header marker");
         };
         assert_eq!(*slot, SLOT);
         assert_eq!(timing.fec_set_index, 0);
@@ -486,7 +548,110 @@ mod tests {
             .collect();
         let (mut asm, events) = run(&packets);
         assert!(events.is_empty());
-        assert_eq!(asm.finish().sets_lost, 3);
+        asm.finish();
+        assert_eq!(asm.stats().sets_lost, 3);
+    }
+
+    // Set events, one per FEC set, decoded or lost
+
+    fn set_events(events: &[Event]) -> Vec<&Event> {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::Set { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn test_set_event_per_decoded_set() {
+        let (asm, events) = run(&arrivals());
+        let sets = set_events(&events);
+        assert_eq!(sets.len(), 4);
+        let mut indexes = Vec::new();
+        for e in sets {
+            let Event::Set {
+                slot,
+                fec_set_index,
+                first_shred_ns,
+                decodable_ns,
+                data_at_decode,
+                recovered,
+                decoded,
+            } = e
+            else {
+                unreachable!()
+            };
+            assert_eq!(*slot, SLOT);
+            assert!(*decoded);
+            assert!(decodable_ns.unwrap() >= *first_shred_ns);
+            // Reed-Solomon runs exactly when some data shreds were missing at decode time
+            assert_eq!(*recovered, *data_at_decode < 32);
+            indexes.push(*fec_set_index);
+        }
+        assert_eq!(indexes, [0, 32, 64, 96]);
+        assert_eq!(asm.stats().txs, 26);
+        assert_eq!(asm.stats().markers, 2);
+    }
+
+    #[test]
+    fn test_set_event_comes_before_its_transactions() {
+        // a reader of the event stream learns about the set before what was decoded from it
+        let (_, events) = run(&arrivals());
+        let first_set = events.iter().position(|e| matches!(e, Event::Set { .. }));
+        let first_other = events.iter().position(|e| !matches!(e, Event::Set { .. }));
+        assert!(first_set.unwrap() < first_other.unwrap());
+    }
+
+    #[test]
+    fn test_finish_emits_lost_sets() {
+        let packets: Vec<_> = arrivals()
+            .into_iter()
+            .filter(|(_, p)| wire::fec_set_index(p).unwrap() != 0)
+            .collect();
+        let (mut asm, _) = run(&packets);
+        let lost = asm.finish();
+        assert_eq!(lost.len(), 3);
+        for e in lost {
+            let Event::Set {
+                decoded,
+                decodable_ns,
+                ..
+            } = e
+            else {
+                panic!("finish should only hand out set events");
+            };
+            assert!(!decoded);
+            // these sets had 32 shreds but waited behind set 0, which never came
+            assert!(decodable_ns.is_some());
+        }
+    }
+
+    #[test]
+    fn test_eviction_emits_lost_set() {
+        let packets: Vec<_> = arrivals()
+            .into_iter()
+            .filter(|(_, p)| wire::fec_set_index(p).unwrap() == 0 && is_data(p))
+            .take(16)
+            .collect();
+        let (mut asm, _) = run(&packets);
+        let mut newer = packets[0].1.to_vec();
+        newer[65..73].copy_from_slice(&(SLOT + MAX_SLOTS_IN_FLIGHT + 1).to_le_bytes());
+        let events = asm.push(&newer, 0);
+        let lost = set_events(&events);
+        assert_eq!(lost.len(), 1);
+        let Event::Set {
+            slot,
+            decodable_ns,
+            data_at_decode,
+            decoded,
+            ..
+        } = lost[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*slot, SLOT);
+        assert!(!decoded);
+        assert_eq!(*decodable_ns, None); // never reached 32 shreds
+        assert_eq!(*data_at_decode, 16); // data shreds it held when given up on
     }
 
     // Real capture, runs only where the raw pcap is present (it is never committed)
@@ -505,12 +670,14 @@ mod tests {
                 txs += signatures(&asm.push(payload, rec.recv_ns)).len();
             }
         }
-        let s = asm.finish().clone();
+        asm.finish();
+        let s = asm.stats().clone();
         assert_eq!(s.packets, 15_907);
         assert_eq!(s.not_shreds, 1);
         assert_eq!(s.slots_complete, 45);
         assert_eq!(s.sets_decoded, 246);
         assert_eq!(s.decode_errors, 0);
         assert_eq!(txs, 2_394);
+        assert_eq!(s.txs, 2_394);
     }
 }
