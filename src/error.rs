@@ -58,4 +58,7 @@ pub enum Error {
     /// Reading the capture failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Writing a record as JSON failed.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }

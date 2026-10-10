@@ -64,7 +64,7 @@ pub enum Event {
 }
 
 /// Shred health counters for the report.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Stats {
     pub packets: u64,
     /// Packets that are not a shred we can read, like the wrong size or an unknown variant.

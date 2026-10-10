@@ -7,6 +7,7 @@
 //! 4. fec collects the shreds of one FEC set and rebuilds missing data shards with Reed-Solomon.
 //! 5. block joins data shards into batches and decodes them into entries or block markers.
 //! 6. assembler runs all of the above on a live or recorded stream, in the right order, with timing.
+//! 7. record writes the assembler's events as JSON lines and the run's totals as a summary.
 //!
 //! error holds the one Error type every module returns.
 pub mod assembler;
@@ -14,5 +15,6 @@ pub mod block;
 pub mod error;
 pub mod fec;
 pub mod pcap;
+pub mod record;
 pub mod shred;
 pub mod wire;
