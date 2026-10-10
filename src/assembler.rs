@@ -245,7 +245,9 @@ impl Assembler {
     /// Gives up on slots too far behind the newest one.
     fn evict_old_slots(&mut self) -> Vec<Event> {
         let cutoff = self.newest_slot.saturating_sub(MAX_SLOTS_IN_FLIGHT);
-        let old: Vec<u64> = self.slots.keys().copied().filter(|s| *s < cutoff).collect();
+        let mut old: Vec<u64> = self.slots.keys().copied().filter(|s| *s < cutoff).collect();
+        // HashMap order changes from run to run, sorting keeps the output the same every time
+        old.sort_unstable();
         let mut events = Vec::new();
         for slot in old {
             events.extend(self.close(slot));
@@ -271,7 +273,8 @@ impl Assembler {
 
     /// End of input. Every set still waiting is given up on, and handed out as lost.
     pub fn finish(&mut self) -> Vec<Event> {
-        let slots: Vec<u64> = self.slots.keys().copied().collect();
+        let mut slots: Vec<u64> = self.slots.keys().copied().collect();
+        slots.sort_unstable();
         let mut events = Vec::new();
         for slot in slots {
             events.extend(self.close(slot));
@@ -623,6 +626,39 @@ mod tests {
             // these sets had 32 shreds but waited behind set 0, which never came
             assert!(decodable_ns.is_some());
         }
+    }
+
+    #[test]
+    fn test_finish_order_is_stable() {
+        // lost sets from several slots come out by slot, then by set, on every run
+        let packets: Vec<_> = arrivals()
+            .into_iter()
+            .filter(|(_, p)| wire::fec_set_index(p).unwrap() != 0)
+            .collect();
+        let mut asm = Assembler::new();
+        for offset in [5u64, 1, 9, 3] {
+            for (t, p) in &packets {
+                let mut shred = p.to_vec();
+                shred[65..73].copy_from_slice(&(SLOT + offset).to_le_bytes());
+                asm.push(&shred, *t);
+            }
+        }
+        let order: Vec<(u64, u32)> = asm
+            .finish()
+            .iter()
+            .filter_map(|e| match e {
+                Event::Set {
+                    slot,
+                    fec_set_index,
+                    ..
+                } => Some((*slot, *fec_set_index)),
+                _ => None,
+            })
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(order.len(), 12);
+        assert_eq!(order, sorted);
     }
 
     #[test]
