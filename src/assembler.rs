@@ -4,7 +4,8 @@
 //! A set decodes as soon as it has 32 shreds, the earliest moment the data can be known.
 //! Sets go to the slot's Batcher strictly in order, because a batch can start in one set and end in the next.
 //! Each finished batch is decoded and handed out as events, one per transaction or marker.
-//! A slot closes when its last shred is decoded, or when it falls too far behind the newest slot.
+//! A slot closes when its last shred is decoded, or when its Alpenglow skip deadline has passed
+//! on the capture clock, 1.45 s after its first shred with 200 ms slots.
 //! Every event carries t0 (first shred of the set), t1 (32nd shred) and t2 (the batch could decode).
 
 use crate::block::{Batcher, Component, decode_component, is_last_in_slot};
@@ -12,10 +13,25 @@ use crate::fec::{DATA_SHREDS, FecSet};
 use crate::shred::{Kind, Shred};
 use crate::wire;
 use solana_transaction::Signature;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Slots this far behind the newest slot seen are given up on, and their unfinished sets counted as lost.
-pub const MAX_SLOTS_IN_FLIGHT: u64 = 32;
+// Alpenglow timing, from Agave votor/src/common.rs and timer_manager/timers.rs.
+// A validator votes skip on slot i of a leader window at
+// ParentReady + DELTA_TIMEOUT + (i + 1) * slot duration, so by
+// first shred + DELTA_TIMEOUT + LEADER_WINDOW_SLOTS * slot + DELTA every honest
+// validator has passed the slot's skip deadline and its shreds are no longer coming.
+
+/// Network delay bound, Agave DELTA.
+pub const DELTA_NS: u64 = 250_000_000;
+/// Base leader handover timeout, Agave DELTA_TIMEOUT.
+pub const DELTA_TIMEOUT_NS: u64 = 400_000_000;
+/// Slots per leader window, Agave NUM_CONSECUTIVE_LEADER_SLOTS.
+pub const LEADER_WINDOW_SLOTS: u64 = 4;
+/// Slot duration on mainnet and testnet. Agave reads it from the bank per epoch.
+pub const DEFAULT_SLOT_NS: u64 = 200_000_000;
+
+/// Closed slots remembered so their late shreds are counted, not reopened. About 14 minutes of slots.
+const CLOSED_SLOTS_KEPT: usize = 4096;
 
 /// When each part of a transaction's journey happened, all in capture nanoseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,8 +109,9 @@ pub struct Stats {
 }
 
 /// Everything in flight for one slot.
-#[derive(Default)]
 struct SlotState {
+    /// Earliest arrival of any shred of this slot, the start of its give up clock.
+    first_seen_ns: u64,
     sets: BTreeMap<u32, FecSet>,
     /// fec_set_index of the next set to hand to the batcher, sets must go in order
     /// because a batch can start in one set and end in the next.
@@ -102,18 +119,43 @@ struct SlotState {
     batcher: Batcher,
 }
 
-#[derive(Default)]
 pub struct Assembler {
     slots: HashMap<u64, SlotState>,
     /// Slots finished or given up on, so their late shreds are counted and not reopened.
-    closed: BTreeMap<u64, ()>,
-    newest_slot: u64,
+    closed: BTreeSet<u64>,
+    /// Capture clock, the newest recv_ns seen, so a reordered packet can't move time backwards.
+    now_ns: u64,
+    /// How long after its first shred a slot is given up on.
+    give_up_ns: u64,
     stats: Stats,
 }
 
+impl Default for Assembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Assembler {
+    /// An assembler for 200 ms slots.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_slot_duration_ns(DEFAULT_SLOT_NS)
+    }
+
+    /// An assembler for another slot duration, which moves the give up deadline with it.
+    pub fn with_slot_duration_ns(slot_ns: u64) -> Self {
+        Self {
+            slots: HashMap::new(),
+            closed: BTreeSet::new(),
+            now_ns: 0,
+            give_up_ns: DELTA_TIMEOUT_NS + LEADER_WINDOW_SLOTS * slot_ns + DELTA_NS,
+            stats: Stats::default(),
+        }
+    }
+
+    /// How long after its first shred a slot is given up on.
+    pub fn give_up_ns(&self) -> u64 {
+        self.give_up_ns
     }
 
     /// Feeds one UDP payload. Returns whatever this packet made decodable.
@@ -126,19 +168,22 @@ impl Assembler {
         };
         let slot = shred.slot;
 
-        let too_old = slot < self.newest_slot.saturating_sub(MAX_SLOTS_IN_FLIGHT);
-        if too_old || self.closed.contains_key(&slot) {
+        // time moves on even for a shred we end up dropping
+        self.now_ns = self.now_ns.max(recv_ns);
+        let mut events = self.give_up_expired_slots();
+
+        if self.closed.contains(&slot) {
             self.stats.late += 1;
-            return Vec::new();
+            return events;
         }
 
-        let mut events = Vec::new();
-        if slot > self.newest_slot {
-            self.newest_slot = slot;
-            events.extend(self.evict_old_slots());
-        }
-
-        let state = self.slots.entry(slot).or_default();
+        let state = self.slots.entry(slot).or_insert_with(|| SlotState {
+            first_seen_ns: recv_ns,
+            sets: BTreeMap::new(),
+            next_set: 0,
+            batcher: Batcher::new(),
+        });
+        state.first_seen_ns = state.first_seen_ns.min(recv_ns);
         if shred.fec_set_index < state.next_set {
             // its set was already decoded, the shred is no longer needed
             self.stats.after_decode += 1;
@@ -242,24 +287,30 @@ impl Assembler {
         events
     }
 
-    /// Gives up on slots too far behind the newest one.
-    fn evict_old_slots(&mut self) -> Vec<Event> {
-        let cutoff = self.newest_slot.saturating_sub(MAX_SLOTS_IN_FLIGHT);
-        let mut old: Vec<u64> = self.slots.keys().copied().filter(|s| *s < cutoff).collect();
+    /// Gives up on every slot whose deadline has passed on the capture clock.
+    fn give_up_expired_slots(&mut self) -> Vec<Event> {
+        let mut expired: Vec<u64> = self
+            .slots
+            .iter()
+            .filter(|(_, state)| self.now_ns > state.first_seen_ns.saturating_add(self.give_up_ns))
+            .map(|(slot, _)| *slot)
+            .collect();
         // HashMap order changes from run to run, sorting keeps the output the same every time
-        old.sort_unstable();
+        expired.sort_unstable();
         let mut events = Vec::new();
-        for slot in old {
+        for slot in expired {
             events.extend(self.close(slot));
         }
-        // slots below the cutoff are refused as too old anyway, so the list stays short
-        self.closed = self.closed.split_off(&cutoff);
         events
     }
 
     /// Drops a slot's state. Every set it never decoded is counted and handed out as lost.
     fn close(&mut self, slot: u64) -> Vec<Event> {
-        self.closed.insert(slot, ());
+        self.closed.insert(slot);
+        // forget the oldest slots first, a junk slot number only takes one place
+        while self.closed.len() > CLOSED_SLOTS_KEPT {
+            self.closed.pop_first();
+        }
         let Some(state) = self.slots.remove(&slot) else {
             return Vec::new();
         };
@@ -521,26 +572,98 @@ mod tests {
         assert!(asm.stats().late > 0);
     }
 
-    #[test]
-    fn test_old_slot_given_up() {
-        // only half of set 0 arrives, then a much newer slot shows up
-        let packets: Vec<_> = arrivals()
+    // a valid shred of some other slot arriving at `at_ns`, which moves the capture clock
+    fn tick(asm: &mut Assembler, at_ns: u64) -> Vec<Event> {
+        let mut other = arrivals()[0].1.to_vec();
+        other[65..73].copy_from_slice(&(SLOT + 1_000).to_le_bytes());
+        asm.push(&other, at_ns)
+    }
+
+    // half of set 0's data shreds, arriving at their real times
+    fn half_set_0() -> Vec<(u64, &'static [u8])> {
+        arrivals()
             .into_iter()
             .filter(|(_, p)| wire::fec_set_index(p).unwrap() == 0 && is_data(p))
             .take(16)
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn test_give_up_deadline_is_alpenglow_skip_timeout() {
+        // 400 ms DELTA_TIMEOUT + 4 slots of 200 ms + 250 ms DELTA
+        assert_eq!(Assembler::new().give_up_ns(), 1_450_000_000);
+        // the deadline moves with the slot duration, 400 ms slots give 2.25 s
+        assert_eq!(
+            Assembler::with_slot_duration_ns(400_000_000).give_up_ns(),
+            2_250_000_000
+        );
+    }
+
+    #[test]
+    fn test_old_slot_given_up() {
+        let packets = half_set_0();
+        let first = packets.iter().map(|(t, _)| *t).min().unwrap();
         let (mut asm, events) = run(&packets);
         assert!(events.is_empty());
 
-        let mut newer = packets[0].1.to_vec();
-        newer[65..73].copy_from_slice(&(SLOT + MAX_SLOTS_IN_FLIGHT + 1).to_le_bytes());
-        asm.push(&newer, 0);
+        // just before the deadline the slot is still open
+        tick(&mut asm, first + 1_440_000_000);
+        assert_eq!(asm.stats().sets_lost, 0);
+
+        // just after it, the slot is given up on
+        tick(&mut asm, first + 1_460_000_000);
         assert_eq!(asm.stats().sets_lost, 1);
 
         // the old slot is closed now, more of its shreds only count as late
         let late_before = asm.stats().late;
-        asm.push(packets[1].1, 0);
+        asm.push(packets[1].1, first + 1_470_000_000);
         assert_eq!(asm.stats().late, late_before + 1);
+    }
+
+    #[test]
+    fn test_longer_slots_wait_longer() {
+        let packets = half_set_0();
+        let first = packets.iter().map(|(t, _)| *t).min().unwrap();
+        let mut asm = Assembler::with_slot_duration_ns(400_000_000);
+        for (t, p) in &packets {
+            asm.push(p, *t);
+        }
+        tick(&mut asm, first + 2_000_000_000);
+        assert_eq!(asm.stats().sets_lost, 0);
+        tick(&mut asm, first + 2_300_000_000);
+        assert_eq!(asm.stats().sets_lost, 1);
+    }
+
+    #[test]
+    fn test_junk_slot_does_not_block() {
+        // a shred with an absurd slot number arrives first, the real slot must still decode
+        let mut junk = arrivals()[0].1.to_vec();
+        junk[65..73].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut packets = vec![(arrivals()[0].0, &junk[..])];
+        packets.extend(arrivals());
+        let (mut asm, events) = run(&packets);
+        assert_eq!(signatures(&events).len(), 26);
+        // the real slot is handled exactly as without the junk shred
+        let (clean, _) = run(&arrivals());
+        assert_eq!(asm.stats().late, clean.stats().late);
+        assert_eq!(asm.stats().sets_decoded, clean.stats().sets_decoded);
+
+        // the junk slot itself is given up on once its deadline passes
+        let last = arrivals().iter().map(|(t, _)| *t).max().unwrap();
+        let lost = tick(&mut asm, last + 1_500_000_000);
+        assert!(lost.iter().any(|e| matches!(e, Event::Set { slot: u64::MAX, .. })));
+    }
+
+    #[test]
+    fn test_reordered_packet_does_not_rewind_the_clock() {
+        // a packet stamped earlier than the newest one must not reopen the deadline
+        let packets = half_set_0();
+        let first = packets.iter().map(|(t, _)| *t).min().unwrap();
+        let (mut asm, _) = run(&packets);
+        tick(&mut asm, first + 1_460_000_000);
+        assert_eq!(asm.stats().sets_lost, 1);
+        tick(&mut asm, first);
+        assert_eq!(asm.stats().sets_lost, 1);
     }
 
     #[test]
@@ -663,15 +786,10 @@ mod tests {
 
     #[test]
     fn test_eviction_emits_lost_set() {
-        let packets: Vec<_> = arrivals()
-            .into_iter()
-            .filter(|(_, p)| wire::fec_set_index(p).unwrap() == 0 && is_data(p))
-            .take(16)
-            .collect();
+        let packets = half_set_0();
+        let first = packets.iter().map(|(t, _)| *t).min().unwrap();
         let (mut asm, _) = run(&packets);
-        let mut newer = packets[0].1.to_vec();
-        newer[65..73].copy_from_slice(&(SLOT + MAX_SLOTS_IN_FLIGHT + 1).to_le_bytes());
-        let events = asm.push(&newer, 0);
+        let events = tick(&mut asm, first + 1_460_000_000);
         let lost = set_events(&events);
         assert_eq!(lost.len(), 1);
         let Event::Set {
