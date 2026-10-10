@@ -30,7 +30,7 @@ pub const LEADER_WINDOW_SLOTS: u64 = 4;
 /// Slot duration on mainnet and testnet. Agave reads it from the bank per epoch.
 pub const DEFAULT_SLOT_NS: u64 = 200_000_000;
 
-/// Closed slots remembered so their late shreds are counted, not reopened. About 14 minutes of slots.
+/// Closed slots remembered so shreds arriving after them are counted, not reopened. About 14 minutes of slots.
 const CLOSED_SLOTS_KEPT: usize = 4096;
 
 /// When each part of a transaction's journey happened, all in capture nanoseconds.
@@ -86,8 +86,8 @@ pub struct Stats {
     /// Packets that are not a shred we can read, like the wrong size or an unknown variant.
     pub not_shreds: u64,
     pub duplicates: u64,
-    /// Shreds for a slot already finished, given up on, or too far behind the newest slot.
-    pub late: u64,
+    /// Shreds that arrived after their slot was finished or given up on, mostly leftover coding shreds.
+    pub after_slot_done: u64,
     /// Shreds whose set was already decoded from the first 32 that arrived.
     pub after_decode: u64,
     /// Shreds a FEC set refused, like an out of range index or a config other than 32 and 32.
@@ -121,7 +121,7 @@ struct SlotState {
 
 pub struct Assembler {
     slots: HashMap<u64, SlotState>,
-    /// Slots finished or given up on, so their late shreds are counted and not reopened.
+    /// Slots finished or given up on, so shreds arriving after them are counted and not reopened.
     closed: BTreeSet<u64>,
     /// Capture clock, the newest recv_ns seen, so a reordered packet can't move time backwards.
     now_ns: u64,
@@ -173,7 +173,7 @@ impl Assembler {
         let mut events = self.give_up_expired_slots();
 
         if self.closed.contains(&slot) {
-            self.stats.late += 1;
+            self.stats.after_slot_done += 1;
             return events;
         }
 
@@ -569,7 +569,7 @@ mod tests {
         let packets = arrivals();
         let (mut asm, _) = run(&packets);
         assert!(asm.push(packets[0].1, 0).is_empty());
-        assert!(asm.stats().late > 0);
+        assert!(asm.stats().after_slot_done > 0);
     }
 
     // a valid shred of some other slot arriving at `at_ns`, which moves the capture clock
@@ -614,10 +614,10 @@ mod tests {
         tick(&mut asm, first + 1_460_000_000);
         assert_eq!(asm.stats().sets_lost, 1);
 
-        // the old slot is closed now, more of its shreds only count as late
-        let late_before = asm.stats().late;
+        // the old slot is closed now, more of its shreds only count as after_slot_done
+        let before = asm.stats().after_slot_done;
         asm.push(packets[1].1, first + 1_470_000_000);
-        assert_eq!(asm.stats().late, late_before + 1);
+        assert_eq!(asm.stats().after_slot_done, before + 1);
     }
 
     #[test]
@@ -645,7 +645,7 @@ mod tests {
         assert_eq!(signatures(&events).len(), 26);
         // the real slot is handled exactly as without the junk shred
         let (clean, _) = run(&arrivals());
-        assert_eq!(asm.stats().late, clean.stats().late);
+        assert_eq!(asm.stats().after_slot_done, clean.stats().after_slot_done);
         assert_eq!(asm.stats().sets_decoded, clean.stats().sets_decoded);
 
         // the junk slot itself is given up on once its deadline passes
