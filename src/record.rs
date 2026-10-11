@@ -46,7 +46,6 @@ struct SetRecord {
     t0_ns: u64,
     t1_ns: Option<u64>,
     data_at_decode: u64,
-    recovered: bool,
     decoded: bool,
 }
 
@@ -129,7 +128,6 @@ impl<W: Write> Output<W> {
                 first_shred_ns,
                 decodable_ns,
                 data_at_decode,
-                recovered,
                 decoded,
             } => {
                 let record = SetRecord {
@@ -138,7 +136,6 @@ impl<W: Write> Output<W> {
                     t0_ns: *first_shred_ns,
                     t1_ns: *decodable_ns,
                     data_at_decode: *data_at_decode,
-                    recovered: *recovered,
                     decoded: *decoded,
                 };
                 write_line(&mut self.sets, &record)
@@ -292,7 +289,6 @@ mod tests {
             first_shred_ns: 100,
             decodable_ns: Some(150),
             data_at_decode: 28,
-            recovered: true,
             decoded: true,
         })
         .unwrap();
@@ -302,16 +298,15 @@ mod tests {
             first_shred_ns: 120,
             decodable_ns: None,
             data_at_decode: 16,
-            recovered: false,
             decoded: false,
         })
         .unwrap();
         assert_eq!(
             lines(&out.sets),
             [
-                r#"{"slot":449661788,"fec_set":32,"t0_ns":100,"t1_ns":150,"data_at_decode":28,"recovered":true,"decoded":true}"#,
+                r#"{"slot":449661788,"fec_set":32,"t0_ns":100,"t1_ns":150,"data_at_decode":28,"decoded":true}"#,
                 // a set that never reached 32 shreds has no t1
-                r#"{"slot":449661788,"fec_set":64,"t0_ns":120,"t1_ns":null,"data_at_decode":16,"recovered":false,"decoded":false}"#,
+                r#"{"slot":449661788,"fec_set":64,"t0_ns":120,"t1_ns":null,"data_at_decode":16,"decoded":false}"#,
             ]
         );
     }

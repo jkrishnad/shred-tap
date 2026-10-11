@@ -88,8 +88,11 @@ fn print_summary(stats: &Stats, out: &Path) {
         stats.packets, stats.slots_complete, stats.txs
     );
     println!(
-        "{} sets decoded, {} with Reed-Solomon, {} lost",
-        stats.sets_decoded, stats.sets_recovered, stats.sets_lost
+        "{} sets decoded, {} rebuilt at t1, {} never got all data, {} lost",
+        stats.sets_decoded,
+        stats.sets_rebuilt_at_t1,
+        stats.sets_data_never_complete,
+        stats.sets_lost
     );
     println!("output in {}", out.display());
 }

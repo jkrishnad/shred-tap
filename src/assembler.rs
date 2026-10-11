@@ -71,9 +71,8 @@ pub enum Event {
         /// The set reached 32 shreds (t1), None if it never did.
         decodable_ns: Option<u64>,
         /// Data shreds the set held when it was decoded or given up on.
+        /// Below 32 on a decoded set means Reed-Solomon rebuilt the rest.
         data_at_decode: u64,
-        /// Reed-Solomon rebuilt missing data shards.
-        recovered: bool,
         /// False when the set was given up on.
         decoded: bool,
     },
@@ -120,8 +119,12 @@ pub struct Stats {
     pub rejected: u64,
     /// Sets whose data shards went to the decoder.
     pub sets_decoded: u64,
-    /// Of those, sets decoded with Reed-Solomon because some data shreds weren't in yet at t1.
-    pub sets_recovered: u64,
+    /// Of those, sets rebuilt with Reed-Solomon because some data shreds weren't in yet at t1.
+    /// Most of those data shreds still arrive later, so this is not loss.
+    pub sets_rebuilt_at_t1: u64,
+    /// Decoded sets whose 32 data shreds never all arrived, real data loss on the wire.
+    /// Counted when a closed slot is forgotten or at finish, since late shreds can still fill a set.
+    pub sets_data_never_complete: u64,
     /// Sets that never reached 32 shreds, or waited behind one that didn't.
     pub sets_lost: u64,
     pub batches: u64,
@@ -311,7 +314,7 @@ impl Assembler {
             state.sets_decoded += 1;
             state.seen.entry(set.fec_set_index).or_default().decoded = true;
             if set.recovered {
-                self.stats.sets_recovered += 1;
+                self.stats.sets_rebuilt_at_t1 += 1;
             }
             events.push(set_event(&set, data_at_decode, true));
 
@@ -418,7 +421,9 @@ impl Assembler {
     fn remember_closed(&mut self, slot: u64, seen: BTreeMap<u32, Seen>) {
         self.closed.insert(slot, seen);
         while self.closed.len() > CLOSED_SLOTS_KEPT {
-            self.closed.pop_first();
+            if let Some((_, sets)) = self.closed.pop_first() {
+                self.stats.sets_data_never_complete += data_never_complete(&sets);
+            }
         }
     }
 
@@ -429,6 +434,10 @@ impl Assembler {
         let mut events = Vec::new();
         for slot in slots {
             events.extend(self.close(slot, SlotEnd::EndOfInput));
+        }
+        // no more shreds can come, so every remembered set is final now
+        for sets in self.closed.values_mut() {
+            self.stats.sets_data_never_complete += data_never_complete(&std::mem::take(sets));
         }
         events
     }
@@ -467,6 +476,13 @@ fn shard_bit(shred: &Shred) -> Option<u64> {
         .then(|| 1u64 << shred.shard_index)
 }
 
+/// Decoded sets of one slot that never got all 32 data shreds, the low 32 seen bits.
+fn data_never_complete(sets: &BTreeMap<u32, Seen>) -> u64 {
+    sets.values()
+        .filter(|seen| seen.decoded && (seen.shreds as u32) != u32::MAX)
+        .count() as u64
+}
+
 /// The Set event for a set, decoded or not.
 fn set_event(set: &FecSet, data_at_decode: u64, decoded: bool) -> Event {
     Event::Set {
@@ -475,7 +491,6 @@ fn set_event(set: &FecSet, data_at_decode: u64, decoded: bool) -> Event {
         first_shred_ns: set.first_seen_ns.unwrap_or(0),
         decodable_ns: set.decodable_ns,
         data_at_decode,
-        recovered: set.recovered,
         decoded,
     }
 }
@@ -635,10 +650,22 @@ mod tests {
                 !(is_data(p) && (40..50).contains(&index))
             })
             .collect();
-        let (asm, events) = run(&packets);
+        let (mut asm, events) = run(&packets);
         assert_eq!(signatures(&events).len(), 26);
         assert_eq!(asm.stats().sets_decoded, 4);
         assert_eq!(asm.stats().sets_lost, 0);
+        // those 10 never arrive, so set 32 never had all its data
+        asm.finish();
+        assert_eq!(asm.stats().sets_data_never_complete, 1);
+    }
+
+    #[test]
+    fn test_rebuilt_at_t1_is_not_loss() {
+        // sets decode before all their data is in, but every data shred of the slot arrives in the end
+        let (mut asm, _) = run(&arrivals());
+        assert!(asm.stats().sets_rebuilt_at_t1 > 0);
+        asm.finish();
+        assert_eq!(asm.stats().sets_data_never_complete, 0);
     }
 
     #[test]
@@ -851,7 +878,6 @@ mod tests {
                 first_shred_ns,
                 decodable_ns,
                 data_at_decode,
-                recovered,
                 decoded,
             } = e
             else {
@@ -860,8 +886,7 @@ mod tests {
             assert_eq!(*slot, SLOT);
             assert!(*decoded);
             assert!(decodable_ns.unwrap() >= *first_shred_ns);
-            // Reed-Solomon runs exactly when some data shreds were missing at decode time
-            assert_eq!(*recovered, *data_at_decode < 32);
+            assert!(*data_at_decode <= 32);
             indexes.push(*fec_set_index);
         }
         assert_eq!(indexes, [0, 32, 64, 96]);
