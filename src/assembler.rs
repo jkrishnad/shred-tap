@@ -200,11 +200,6 @@ impl Assembler {
         }
     }
 
-    /// How long after its first shred a slot is given up on.
-    pub fn give_up_ns(&self) -> u64 {
-        self.give_up_ns
-    }
-
     /// Feeds one UDP payload. Returns whatever this packet made decodable.
     pub fn push(&mut self, payload: &[u8], recv_ns: u64) -> Vec<Event> {
         self.stats.packets += 1;
@@ -265,17 +260,11 @@ impl Assembler {
             .sets
             .entry(shred.fec_set_index)
             .or_insert_with(|| FecSet::new(slot, shred.fec_set_index));
-        match set.push(shred) {
-            Ok(true) => seen.shreds |= bit,
-            Ok(false) => {
-                self.stats.duplicates += 1;
-                return events;
-            }
-            Err(_) => {
-                self.stats.rejected += 1;
-                return events;
-            }
+        if set.push(shred).is_err() {
+            self.stats.rejected += 1;
+            return events;
         }
+        seen.shreds |= bit;
 
         events.extend(self.drain(slot, recv_ns));
         events
@@ -765,10 +754,10 @@ mod tests {
     #[test]
     fn test_give_up_deadline_is_alpenglow_skip_timeout() {
         // 400 ms DELTA_TIMEOUT + 4 slots of 200 ms + 250 ms DELTA
-        assert_eq!(Assembler::new().give_up_ns(), 1_450_000_000);
+        assert_eq!(Assembler::new().give_up_ns, 1_450_000_000);
         // the deadline moves with the slot duration, 400 ms slots give 2.25 s
         assert_eq!(
-            Assembler::with_slot_duration_ns(400_000_000).give_up_ns(),
+            Assembler::with_slot_duration_ns(400_000_000).give_up_ns,
             2_250_000_000
         );
     }
