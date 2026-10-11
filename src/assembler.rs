@@ -9,11 +9,11 @@
 //! Every event carries t0 (first shred of the set), t1 (32nd shred) and t2 (the batch could decode).
 
 use crate::block::{Batcher, Component, decode_component, is_last_in_slot};
-use crate::fec::{DATA_SHREDS, FecSet};
+use crate::fec::{DATA_SHREDS, FecSet, TOTAL_SHREDS};
 use crate::shred::{Kind, Shred};
 use crate::wire;
 use solana_transaction::Signature;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 // Alpenglow timing, from Agave votor/src/common.rs and timer_manager/timers.rs.
 // A validator votes skip on slot i of a leader window at
@@ -110,10 +110,11 @@ pub struct Stats {
     pub packets: u64,
     /// Packets that are not a shred we can read, like the wrong size or an unknown variant.
     pub not_shreds: u64,
+    /// Shreds seen before, wherever their slot or set was when the copy arrived.
     pub duplicates: u64,
-    /// Shreds that arrived after their slot was finished or given up on, mostly leftover coding shreds.
+    /// First copies of shreds that arrived after their slot was finished or given up on, mostly leftover coding shreds.
     pub after_slot_done: u64,
-    /// Shreds whose set was already decoded from the first 32 that arrived.
+    /// First copies of shreds whose set was already decoded from the first 32 that arrived.
     pub after_decode: u64,
     /// Shreds a FEC set refused, like an out of range index or a config other than 32 and 32.
     pub rejected: u64,
@@ -133,6 +134,14 @@ pub struct Stats {
     pub markers: u64,
 }
 
+/// Which shreds of one FEC set have arrived, kept after the set is decoded and its slot closed.
+#[derive(Default)]
+struct Seen {
+    /// Bit i is set once shard index i has arrived, data at bits 0..32 and coding at 32..64.
+    shreds: u64,
+    decoded: bool,
+}
+
 /// Everything in flight for one slot.
 struct SlotState {
     /// Earliest arrival of any shred of this slot, the start of its give up clock.
@@ -149,12 +158,15 @@ struct SlotState {
     footer: bool,
     /// When the slot's latest batch decoded.
     done_ns: Option<u64>,
+    /// Shreds seen per set, by fec_set_index.
+    seen: BTreeMap<u32, Seen>,
 }
 
 pub struct Assembler {
     slots: HashMap<u64, SlotState>,
-    /// Slots finished or given up on, so shreds arriving after them are counted and not reopened.
-    closed: BTreeSet<u64>,
+    /// Slots finished or given up on, with the shreds they saw,
+    /// so shreds arriving after them are counted and not reopened.
+    closed: BTreeMap<u64, BTreeMap<u32, Seen>>,
     /// Capture clock, the newest recv_ns seen, so a reordered packet can't move time backwards.
     now_ns: u64,
     /// How long after its first shred a slot is given up on.
@@ -178,7 +190,7 @@ impl Assembler {
     pub fn with_slot_duration_ns(slot_ns: u64) -> Self {
         Self {
             slots: HashMap::new(),
-            closed: BTreeSet::new(),
+            closed: BTreeMap::new(),
             now_ns: 0,
             give_up_ns: DELTA_TIMEOUT_NS + LEADER_WINDOW_SLOTS * slot_ns + DELTA_NS,
             stats: Stats::default(),
@@ -204,8 +216,20 @@ impl Assembler {
         self.now_ns = self.now_ns.max(recv_ns);
         let mut events = self.give_up_expired_slots();
 
-        if self.closed.contains(&slot) {
-            self.stats.after_slot_done += 1;
+        let Some(bit) = shard_bit(&shred) else {
+            self.stats.rejected += 1;
+            return events;
+        };
+
+        // the seen bits are checked first, so a copy is a duplicate however late it comes
+        if let Some(sets) = self.closed.get_mut(&slot) {
+            let seen = sets.entry(shred.fec_set_index).or_default();
+            if seen.shreds & bit != 0 {
+                self.stats.duplicates += 1;
+            } else {
+                seen.shreds |= bit;
+                self.stats.after_slot_done += 1;
+            }
             return events;
         }
 
@@ -219,10 +243,17 @@ impl Assembler {
             txs: 0,
             footer: false,
             done_ns: None,
+            seen: BTreeMap::new(),
         });
         state.first_seen_ns = state.first_seen_ns.min(recv_ns);
+        let seen = state.seen.entry(shred.fec_set_index).or_default();
+        if seen.shreds & bit != 0 {
+            self.stats.duplicates += 1;
+            return events;
+        }
         if shred.fec_set_index < state.next_set {
             // its set was already decoded, the shred is no longer needed
+            seen.shreds |= bit;
             self.stats.after_decode += 1;
             return events;
         }
@@ -232,7 +263,7 @@ impl Assembler {
             .entry(shred.fec_set_index)
             .or_insert_with(|| FecSet::new(slot, shred.fec_set_index));
         match set.push(shred) {
-            Ok(true) => {}
+            Ok(true) => seen.shreds |= bit,
             Ok(false) => {
                 self.stats.duplicates += 1;
                 return events;
@@ -278,6 +309,7 @@ impl Assembler {
             }
             self.stats.sets_decoded += 1;
             state.sets_decoded += 1;
+            state.seen.entry(set.fec_set_index).or_default().decoded = true;
             if set.recovered {
                 self.stats.sets_recovered += 1;
             }
@@ -357,14 +389,11 @@ impl Assembler {
 
     /// Drops a slot's state. Every set it never decoded is handed out as lost, then the slot itself.
     fn close(&mut self, slot: u64, end: SlotEnd) -> Vec<Event> {
-        self.closed.insert(slot);
-        // forget the oldest slots first, a junk slot number only takes one place
-        while self.closed.len() > CLOSED_SLOTS_KEPT {
-            self.closed.pop_first();
-        }
-        let Some(state) = self.slots.remove(&slot) else {
+        let Some(mut state) = self.slots.remove(&slot) else {
+            self.remember_closed(slot, BTreeMap::new());
             return Vec::new();
         };
+        self.remember_closed(slot, std::mem::take(&mut state.seen));
         self.stats.sets_lost += state.sets.len() as u64;
         let mut events: Vec<Event> = state
             .sets
@@ -382,6 +411,15 @@ impl Assembler {
             end,
         });
         events
+    }
+
+    /// Keeps a closed slot's seen shreds, forgetting the oldest slots first.
+    /// A junk slot number only takes one place.
+    fn remember_closed(&mut self, slot: u64, seen: BTreeMap<u32, Seen>) {
+        self.closed.insert(slot, seen);
+        while self.closed.len() > CLOSED_SLOTS_KEPT {
+            self.closed.pop_first();
+        }
     }
 
     /// End of input. Every set still waiting is given up on, and handed out as lost.
@@ -409,6 +447,24 @@ fn parse_full_shred(payload: &[u8], recv_ns: u64) -> Option<Shred> {
         Kind::Code => wire::CODING_PAYLOAD_SIZE,
     };
     (payload.len() == expected).then_some(shred)
+}
+
+/// The seen bit for a shred's place in its set, None if the place is outside its kind's range.
+/// A coding shred's place only means something with 32 data shreds, so that is checked too.
+fn shard_bit(shred: &Shred) -> Option<u64> {
+    let range = match shred.variant.kind {
+        Kind::Data => 0..DATA_SHREDS,
+        Kind::Code => {
+            let num_data = wire::num_data(&shred.bytes).ok()?;
+            if usize::from(num_data) != DATA_SHREDS {
+                return None;
+            }
+            DATA_SHREDS..TOTAL_SHREDS
+        }
+    };
+    range
+        .contains(&shred.shard_index)
+        .then(|| 1u64 << shred.shard_index)
 }
 
 /// The Set event for a set, decoded or not.
@@ -603,8 +659,33 @@ mod tests {
         assert_eq!(signatures(&events).len(), 26);
         let s = asm.stats();
         assert_eq!(s.not_shreds, 3);
-        assert!(s.duplicates > 0);
+        // every second copy is a duplicate, even the ones after their set or slot was done
+        assert_eq!(s.duplicates, 255);
         assert_eq!(s.rejected, 0);
+        // only first copies count as late
+        let (clean, _) = run(&arrivals());
+        assert_eq!(s.after_decode, clean.stats().after_decode);
+        assert_eq!(s.after_slot_done, clean.stats().after_slot_done);
+    }
+
+    #[test]
+    fn test_duplicate_after_decode() {
+        // set 0 decodes from its first 32 shreds, then a copy of one of them arrives
+        let set0: Vec<_> = arrivals()
+            .into_iter()
+            .filter(|(_, p)| wire::fec_set_index(p).unwrap() == 0)
+            .collect();
+        let (mut asm, _) = run(&set0[..32]);
+        assert_eq!(asm.stats().sets_decoded, 1);
+        let (t, p) = set0[0];
+        asm.push(p, t);
+        assert_eq!(asm.stats().duplicates, 1);
+        assert_eq!(asm.stats().after_decode, 0);
+        // a shred of the set not seen before is late, not a duplicate
+        let (t, p) = set0[32];
+        asm.push(p, t);
+        assert_eq!(asm.stats().duplicates, 1);
+        assert_eq!(asm.stats().after_decode, 1);
     }
 
     #[test]
@@ -630,8 +711,12 @@ mod tests {
     fn test_late_shreds_after_slot_done() {
         let packets = arrivals();
         let (mut asm, _) = run(&packets);
+        let late = asm.stats().after_slot_done;
+        assert!(late > 0);
+        // a copy of a shred the slot already had is a duplicate, not late
         assert!(asm.push(packets[0].1, 0).is_empty());
-        assert!(asm.stats().after_slot_done > 0);
+        assert_eq!(asm.stats().duplicates, 1);
+        assert_eq!(asm.stats().after_slot_done, late);
     }
 
     // a valid shred of some other slot arriving at `at_ns`, which moves the capture clock
@@ -676,9 +761,13 @@ mod tests {
         tick(&mut asm, first + 1_460_000_000);
         assert_eq!(asm.stats().sets_lost, 1);
 
-        // the old slot is closed now, more of its shreds only count as after_slot_done
+        // the old slot is closed now, a new shred of it only counts as after_slot_done
+        let (_, unseen) = arrivals()
+            .into_iter()
+            .find(|(_, p)| wire::fec_set_index(p).unwrap() == 32)
+            .unwrap();
         let before = asm.stats().after_slot_done;
-        asm.push(packets[1].1, first + 1_470_000_000);
+        asm.push(unseen, first + 1_470_000_000);
         assert_eq!(asm.stats().after_slot_done, before + 1);
     }
 
