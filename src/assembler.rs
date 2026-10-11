@@ -818,7 +818,10 @@ mod tests {
         // the junk slot itself is given up on once its deadline passes
         let last = arrivals().iter().map(|(t, _)| *t).max().unwrap();
         let lost = tick(&mut asm, last + 1_500_000_000);
-        assert!(lost.iter().any(|e| matches!(e, Event::Set { slot: u64::MAX, .. })));
+        assert!(
+            lost.iter()
+                .any(|e| matches!(e, Event::Set { slot: u64::MAX, .. }))
+        );
     }
 
     #[test]

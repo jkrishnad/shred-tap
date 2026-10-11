@@ -291,10 +291,7 @@ mod tests {
         let mut r = PcapReader::new(&file[..]).unwrap();
         assert!(matches!(
             r.next_record(),
-            Err(Error::PcapRecordTooLarge {
-                snaplen: 65535,
-                ..
-            })
+            Err(Error::PcapRecordTooLarge { snaplen: 65535, .. })
         ));
     }
 

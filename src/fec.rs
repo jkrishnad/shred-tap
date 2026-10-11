@@ -106,7 +106,10 @@ impl FecSet {
 
     /// Data shreds held.
     pub fn data_received(&self) -> usize {
-        self.shards[..DATA_SHREDS].iter().filter(|s| s.is_some()).count()
+        self.shards[..DATA_SHREDS]
+            .iter()
+            .filter(|s| s.is_some())
+            .count()
     }
 
     /// All 32 data shards present, nothing to rebuild.

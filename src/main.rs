@@ -15,7 +15,10 @@ use shredtap::pcap::{PcapReader, udp_payload};
 use shredtap::record::{Output, write_summary};
 
 #[derive(Parser)]
-#[command(version, about = "Observe and decode the shreds that reach a Solana validator")]
+#[command(
+    version,
+    about = "Observe and decode the shreds that reach a Solana validator"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
