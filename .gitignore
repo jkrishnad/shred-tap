@@ -1,4 +1,4 @@
 /target
 *.pcap
-*pcapng
+*.pcapng
 /out*/
