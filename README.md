@@ -8,7 +8,9 @@ shredtap reads a packet capture of the shreds arriving at a node, puts the FEC s
 
 Tested on Solana testnet. Blocks rebuilt from captured shreds match the same blocks fetched with getBlock, transaction for transaction.
 
-> shredtap does not verify Merkle proofs or leader signatures. Only feed it traffic captured on your own node.
+Every shred's Merkle proof is checked against its FEC set's root, and every set rebuilt with Reed-Solomon is checked by building its whole Merkle tree again. A changed shred is dropped and counted.
+
+> shredtap does not verify leader signatures, so a whole FEC set forged from scratch would still pass. Only feed it traffic captured on your own node.
 
 ## Build
 
@@ -44,7 +46,7 @@ Use `-` instead of a file to decode a live tcpdump pipe. A capture holds your pe
 2. `sets.jsonl`, every FEC set and how many data shreds it had when decoded
 3. `markers.jsonl`, block header and footer markers
 4. `slots.jsonl`, every slot and how it ended
-5. `summary.json`, totals for duplicates, late shreds, lost sets and recovery
+5. `summary.json`, totals for duplicates, late shreds, bad Merkle proofs, lost sets and recovery
 
 ## What it showed
 
