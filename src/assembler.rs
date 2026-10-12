@@ -9,6 +9,7 @@
 //! Every event carries t0 (first shred of the set), t1 (32nd shred) and t2 (the batch could decode).
 
 use crate::block::{Batcher, Component, decode_component, is_last_in_slot};
+use crate::error::Error;
 use crate::fec::{DATA_SHREDS, FecSet, TOTAL_SHREDS};
 use crate::shred::{Kind, Shred};
 use crate::wire;
@@ -117,6 +118,8 @@ pub struct Stats {
     pub after_decode: u64,
     /// Shreds a FEC set refused, like an out of range index or a config other than 32 and 32.
     pub rejected: u64,
+    /// Shreds whose Merkle proof does not climb to their FEC set's root, so they were changed or forged.
+    pub bad_proof: u64,
     /// Sets whose data shards went to the decoder.
     pub sets_decoded: u64,
     /// Of those, sets rebuilt with Reed-Solomon because some data shreds weren't in yet at t1.
@@ -260,9 +263,16 @@ impl Assembler {
             .sets
             .entry(shred.fec_set_index)
             .or_insert_with(|| FecSet::new(slot, shred.fec_set_index));
-        if set.push(shred).is_err() {
-            self.stats.rejected += 1;
-            return events;
+        match set.push(shred) {
+            Ok(_) => {}
+            Err(Error::InvalidMerkleProof { .. } | Error::MerkleRootMismatch { .. }) => {
+                self.stats.bad_proof += 1;
+                return events;
+            }
+            Err(_) => {
+                self.stats.rejected += 1;
+                return events;
+            }
         }
         seen.shreds |= bit;
 
@@ -678,10 +688,38 @@ mod tests {
         // every second copy is a duplicate, even the ones after their set or slot was done
         assert_eq!(s.duplicates, 255);
         assert_eq!(s.rejected, 0);
+        assert_eq!(s.bad_proof, 0);
         // only first copies count as late
         let (clean, _) = run(&arrivals());
         assert_eq!(s.after_decode, clean.stats().after_decode);
         assert_eq!(s.after_slot_done, clean.stats().after_slot_done);
+    }
+
+    #[test]
+    fn test_changed_shred_dropped() {
+        // the second shred of set 32 to arrive has one byte changed on the way
+        let mut packets: Vec<(u64, Vec<u8>)> = arrivals()
+            .into_iter()
+            .map(|(t, p)| (t, p.to_vec()))
+            .collect();
+        let at = packets
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, p))| wire::fec_set_index(p).unwrap() == 32)
+            .nth(1)
+            .unwrap()
+            .0;
+        packets[at].1[200] ^= 1;
+
+        let mut asm = Assembler::new();
+        let mut events = Vec::new();
+        for (t, p) in &packets {
+            events.extend(asm.push(p, *t));
+        }
+        assert_eq!(asm.stats().bad_proof, 1);
+        assert_eq!(asm.stats().rejected, 0);
+        // the set still has 63 good shreds, so the slot decodes as before
+        assert_eq!(signatures(&events).len(), 26);
     }
 
     #[test]
@@ -1061,6 +1099,8 @@ mod tests {
         assert_eq!(s.slots_complete, 45);
         assert_eq!(s.sets_decoded, 246);
         assert_eq!(s.decode_errors, 0);
+        // every real shred climbs to its set's root
+        assert_eq!(s.bad_proof, 0);
         assert_eq!(txs, 2_394);
         assert_eq!(s.txs, 2_394);
     }

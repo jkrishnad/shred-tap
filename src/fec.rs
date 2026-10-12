@@ -2,11 +2,13 @@
 //!
 //! A set has 64 places, 32 data shards then 32 coding shards, filled by shard index as shreds arrive.
 //! push checks each shred belongs here, drops duplicates and keeps only its shard bytes.
+//! Belonging includes the Merkle proof, every shred must climb to the same root as the first one.
 //! Any 32 of the 64 are enough, so once 32 are in, recover fills the missing data places.
 //! data_shards then hands the 32 data shards over in order for the block decoder.
 //! The set also records when its first shred arrived (t0) and when it became rebuildable (t1).
 
 use crate::error::{Error, Result};
+use crate::merkle::{Hash, shred_root};
 use crate::shred::{Kind, Shred, layout};
 use crate::wire;
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -28,6 +30,8 @@ pub struct FecSet {
     pub decodable_ns: Option<u64>,
     /// True if Reed-Solomon had to rebuild missing data shards.
     pub recovered: bool,
+    /// Merkle root of the set, from the first shred that was let in.
+    pub root: Option<Hash>,
 }
 
 impl FecSet {
@@ -39,6 +43,7 @@ impl FecSet {
             first_seen_ns: None,
             decodable_ns: None,
             recovered: false,
+            root: None,
         }
     }
 
@@ -73,6 +78,14 @@ impl FecSet {
             return Err(Error::ShardIndexOutOfRange(shred.shard_index));
         }
 
+        // a shred whose proof leads somewhere else does not belong to this set
+        let root = shred_root(&shred)?;
+        if self.root.is_some_and(|expected| expected != root) {
+            return Err(Error::MerkleRootMismatch {
+                shard_index: shred.shard_index,
+            });
+        }
+
         if self.shards[shred.shard_index].is_some() {
             return Ok(false);
         }
@@ -85,6 +98,7 @@ impl FecSet {
             actual: shred.bytes.len(),
         })?;
         self.shards[shred.shard_index] = Some(bytes.to_vec());
+        self.root.get_or_insert(root);
 
         // t0 is the earliest arrival, even if shreds are pushed out of order
         self.first_seen_ns = Some(match self.first_seen_ns {
@@ -231,6 +245,22 @@ mod tests {
         assert!(set.push(shred(5)).unwrap());
         assert!(!set.push(shred(5)).unwrap());
         assert_eq!(set.received(), 1);
+    }
+
+    #[test]
+    fn test_changed_shred_refused() {
+        let mut set = new_set();
+        set.push(shred(0)).unwrap();
+        // one flipped byte in the block data of shard 5
+        let mut changed = shred(5);
+        changed.bytes[200] ^= 1;
+        assert!(matches!(
+            set.push(changed),
+            Err(Error::MerkleRootMismatch { shard_index: 5 })
+        ));
+        assert_eq!(set.received(), 1);
+        // the real shard 5 still gets in afterwards
+        assert!(set.push(shred(5)).unwrap());
     }
 
     #[test]

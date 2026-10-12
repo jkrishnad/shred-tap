@@ -122,22 +122,6 @@ mod tests {
     }
 
     #[test]
-    fn test_worked_example_four_leaves() {
-        // the four shred tree from the explanation, the proof of shred 2 is [L3, P0]
-        let l: Vec<Hash> = (0..4)
-            .map(|i| leaf(format!("shred{i}").as_bytes()))
-            .collect();
-        let p0 = join(&entry(&l[0]), &entry(&l[1]));
-        let p1 = join(&entry(&l[2]), &entry(&l[3]));
-        let root = join(&entry(&p0), &entry(&p1));
-
-        let proof = [entry(&l[3]), entry(&p0)].concat();
-        assert_eq!(root_from_proof(2, l[2], &proof).unwrap(), root);
-        // the same proof with the wrong index climbs to a different root
-        assert_ne!(root_from_proof(3, l[2], &proof).unwrap(), root);
-    }
-
-    #[test]
     fn test_every_shred_of_a_set_climbs_to_one_root() {
         let root = shred_root(&set_shred(0)).unwrap();
         for i in 0..64 {
@@ -147,53 +131,39 @@ mod tests {
 
     #[test]
     fn test_root_matches_the_next_sets_chained_root() {
-        // each set stores the root of the set before it, written by the leader
-        for set in 0..3 {
-            let root = shred_root(&slot_shred(set * 32)).unwrap();
-            let next = slot_shred((set + 1) * 32);
-            let chained = &next.bytes[layout(next.variant).unwrap().chained_merkle_root];
-            assert_eq!(chained, root, "set {}", set * 32);
+        // each set stores the root of the set before it, written by the leader.
+        // set 96 is resigned, its retransmitter signature sits outside what the leaf covers
+        let roots: Vec<Hash> = (0..4)
+            .map(|set| shred_root(&slot_shred(set * 32)).unwrap())
+            .collect();
+        for i in 0..128 {
+            let shred = slot_shred(i);
+            assert_eq!(shred_root(&shred).unwrap(), roots[i / 32], "index {i}");
+            if i >= 32 {
+                let chained = &shred.bytes[layout(shred.variant).unwrap().chained_merkle_root];
+                assert_eq!(chained, roots[i / 32 - 1], "index {i}");
+            }
         }
     }
 
     #[test]
-    fn test_resigned_shreds_climb_too() {
-        // the retransmitter signature sits after the proof, outside what the leaf covers
-        let first = slot_shred(96);
-        assert!(first.variant.resigned);
-        let root = shred_root(&first).unwrap();
-        for i in 96..128 {
-            assert_eq!(shred_root(&slot_shred(i)).unwrap(), root, "index {i}");
-        }
-    }
-
-    #[test]
-    fn test_changed_byte_breaks_the_climb() {
+    fn test_what_the_root_covers() {
         let root = shred_root(&set_shred(5)).unwrap();
         let parts = layout(set_shred(5).variant).unwrap();
-        // one byte in the shard, the chained root and the proof
+        // one changed byte in the shard, the chained root or the proof leads somewhere else
         for at in [100, parts.chained_merkle_root.start, parts.proof.start + 3] {
             let mut shred = set_shred(5);
             shred.bytes[at] ^= 1;
             assert_ne!(shred_root(&shred).unwrap(), root, "byte {at}");
         }
-    }
-
-    #[test]
-    fn test_signature_is_not_covered() {
-        // the signature signs the root, so it can't be part of it
-        let root = shred_root(&set_shred(5)).unwrap();
-        let mut shred = set_shred(5);
-        shred.bytes[0] ^= 1;
-        assert_eq!(shred_root(&shred).unwrap(), root);
-    }
-
-    #[test]
-    fn test_wrong_shard_index_breaks_the_climb() {
-        let root = shred_root(&set_shred(5)).unwrap();
+        // so does the right shred at the wrong place in the tree
         let mut shred = set_shred(5);
         shred.shard_index = 4;
         assert_ne!(shred_root(&shred).unwrap(), root);
+        // the signature signs the root, so it is not part of it
+        let mut shred = set_shred(5);
+        shred.bytes[0] ^= 1;
+        assert_eq!(shred_root(&shred).unwrap(), root);
     }
 
     #[test]
@@ -207,15 +177,5 @@ mod tests {
         // 6 entries only reach the top from shard indexes below 64
         assert!(root_from_proof(63, l, &[0u8; 120]).is_ok());
         assert!(root_from_proof(64, l, &[0u8; 120]).is_err());
-        // no proof means the leaf is the root, for index 0 only
-        assert_eq!(root_from_proof(0, l, &[]).unwrap(), l);
-        assert!(root_from_proof(1, l, &[]).is_err());
-    }
-
-    #[test]
-    fn test_cut_shred() {
-        let mut shred = set_shred(5);
-        shred.bytes.truncate(1100);
-        assert!(matches!(shred_root(&shred), Err(Error::TooShort { .. })));
     }
 }

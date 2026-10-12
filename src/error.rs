@@ -46,6 +46,9 @@ pub enum Error {
     /// Merkle proof whose length is not whole 20 byte entries, or too short for the shard index.
     #[error("invalid merkle proof for shard index {shard_index}")]
     InvalidMerkleProof { shard_index: usize },
+    /// Shred whose proof climbs to a different root than the rest of its FEC set.
+    #[error("merkle root of shard index {shard_index} does not match its fec set")]
+    MerkleRootMismatch { shard_index: usize },
     /// Entry batch bytes that don't decode as entries.
     #[error("entry decode failed: {0}")]
     Decode(#[from] wincode::ReadError),
