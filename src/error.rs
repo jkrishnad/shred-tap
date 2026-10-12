@@ -49,6 +49,9 @@ pub enum Error {
     /// Shred whose proof climbs to a different root than the rest of its FEC set.
     #[error("merkle root of shard index {shard_index} does not match its fec set")]
     MerkleRootMismatch { shard_index: usize },
+    /// The tree built from a rebuilt set does not end at the set's root, so the rebuild is wrong.
+    #[error("rebuilt fec set does not match its merkle root")]
+    RebuiltRootMismatch,
     /// Entry batch bytes that don't decode as entries.
     #[error("entry decode failed: {0}")]
     Decode(#[from] wincode::ReadError),

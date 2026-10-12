@@ -3,12 +3,13 @@
 //! A set has 64 places, 32 data shards then 32 coding shards, filled by shard index as shreds arrive.
 //! push checks each shred belongs here, drops duplicates and keeps only its shard bytes.
 //! Belonging includes the Merkle proof, every shred must climb to the same root as the first one.
-//! Any 32 of the 64 are enough, so once 32 are in, recover fills the missing data places.
+//! Any 32 of the 64 are enough, so once 32 are in, recover fills the missing places.
+//! A rebuilt shard has no proof, so recover then builds the whole Merkle tree and checks its root.
 //! data_shards then hands the 32 data shards over in order for the block decoder.
 //! The set also records when its first shred arrived (t0) and when it became rebuildable (t1).
 
 use crate::error::{Error, Result};
-use crate::merkle::{Hash, shred_root};
+use crate::merkle::{self, Hash, shred_root};
 use crate::shred::{Kind, Shred, layout};
 use crate::wire;
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -32,6 +33,11 @@ pub struct FecSet {
     pub recovered: bool,
     /// Merkle root of the set, from the first shred that was let in.
     pub root: Option<Hash>,
+    /// Root of the previous set, the same in every shred of this one.
+    chained_root: Option<Vec<u8>>,
+    /// The first 89 bytes of a coding shred, signature and headers.
+    /// Rebuilt coding shreds get the same headers with their own index and position.
+    coding_header: Option<Vec<u8>>,
 }
 
 impl FecSet {
@@ -44,6 +50,8 @@ impl FecSet {
             decodable_ns: None,
             recovered: false,
             root: None,
+            chained_root: None,
+            coding_header: None,
         }
     }
 
@@ -90,15 +98,25 @@ impl FecSet {
             return Ok(false);
         }
 
-        // keep only the shard bytes, which is all Reed-Solomon works on
-        let shard = layout(shred.variant)?.shard;
-        let expected = shard.end;
-        let bytes = shred.bytes.get(shard).ok_or(Error::TooShort {
-            expected,
+        // keep the shard bytes, which is all Reed-Solomon works on,
+        // plus what a rebuilt shred's leaf needs and the shard doesn't hold
+        let parts = layout(shred.variant)?;
+        let too_short = || Error::TooShort {
+            expected: parts.proof.start,
             actual: shred.bytes.len(),
-        })?;
+        };
+        let bytes = shred.bytes.get(parts.shard.clone()).ok_or_else(too_short)?;
+        let chained = shred
+            .bytes
+            .get(parts.chained_merkle_root.clone())
+            .ok_or_else(too_short)?;
+        if shred.variant.kind == Kind::Code && self.coding_header.is_none() {
+            let header = shred.bytes.get(..parts.shard.start).ok_or_else(too_short)?;
+            self.coding_header = Some(header.to_vec());
+        }
         self.shards[shred.shard_index] = Some(bytes.to_vec());
         self.root.get_or_insert(root);
+        self.chained_root.get_or_insert_with(|| chained.to_vec());
 
         // t0 is the earliest arrival, even if shreds are pushed out of order
         self.first_seen_ns = Some(match self.first_seen_ns {
@@ -136,7 +154,8 @@ impl FecSet {
         self.received() >= DATA_SHREDS
     }
 
-    /// Rebuilds missing data shards. Does nothing if the data is already complete.
+    /// Rebuilds missing shards and checks the result against the set's root.
+    /// Does nothing if the data is already complete.
     pub fn recover(&mut self) -> Result<()> {
         if self.is_complete() {
             return Ok(());
@@ -146,10 +165,51 @@ impl FecSet {
         }
         // built per call rather than once in a static, so nothing here can panic
         let rs = ReedSolomon::new(DATA_SHREDS, CODING_SHREDS)?;
-        // fills the None data slots in place, coding slots are left as they are
-        rs.reconstruct_data(&mut self.shards)?;
+        // fills every None place, coding too, since the tree needs all 64 leaves
+        rs.reconstruct(&mut self.shards)?;
         self.recovered = true;
-        Ok(())
+        self.check_rebuilt_root()
+    }
+
+    /// Builds the whole Merkle tree from the 64 shards and checks it ends at the set's root.
+    fn check_rebuilt_root(&self) -> Result<()> {
+        let mismatch = Error::RebuiltRootMismatch;
+        let (Some(root), Some(chained), Some(header)) =
+            (self.root, &self.chained_root, &self.coding_header)
+        else {
+            return Err(mismatch);
+        };
+
+        // coding shreds of a set differ only in index and position, so the first one's
+        // index is this header's index minus its position
+        let first_index = wire::index(header)?
+            .checked_sub(u32::from(wire::position(header)?))
+            .ok_or(Error::RebuiltRootMismatch)?;
+
+        let mut leaves = Vec::with_capacity(TOTAL_SHREDS);
+        for (i, shard) in self.shards.iter().enumerate() {
+            let shard = shard.as_deref().ok_or(self.too_few())?;
+            // a data shard starts right after the signature, so it already holds its headers
+            if i < DATA_SHREDS {
+                leaves.push(merkle::leaf(&[shard, chained]));
+                continue;
+            }
+            let position = (i - DATA_SHREDS) as u16;
+            let index = first_index
+                .checked_add(u32::from(position))
+                .ok_or(Error::RebuiltRootMismatch)?;
+            let mut own = header.clone();
+            own[wire::INDEX].copy_from_slice(&index.to_le_bytes());
+            own[wire::POSITION].copy_from_slice(&position.to_le_bytes());
+            // the leaf starts after the signature, like every other leaf
+            leaves.push(merkle::leaf(&[&own[wire::SIGNATURE.end..], shard, chained]));
+        }
+
+        if merkle::tree_root(&leaves) == Some(root) {
+            Ok(())
+        } else {
+            Err(mismatch)
+        }
     }
 
     /// The 32 data shards in order, ready for the block decoder.
@@ -327,6 +387,19 @@ mod tests {
         for (i, s) in shards.iter().enumerate() {
             assert_eq!(*s, original_data_shard(i), "data shard {i}");
         }
+    }
+
+    #[test]
+    fn test_wrong_rebuild_caught_by_the_root() {
+        // a shard that changed after its proof was checked, so Reed-Solomon rebuilds wrong data
+        let mut set = new_set();
+        for i in (0..16).chain(32..48) {
+            set.push(shred(i)).unwrap();
+        }
+        if let Some(shard) = set.shards[40].as_mut() {
+            shard[100] ^= 1;
+        }
+        assert!(matches!(set.recover(), Err(Error::RebuiltRootMismatch)));
     }
 
     #[test]

@@ -12,6 +12,9 @@
 //!    the left child (even) or the right child (odd), then it is halved for the next level up.
 //! 4. join hashes two children into their parent, entry and sha256 are its helpers.
 //!
+//! tree_root builds the whole tree from all 64 leaves instead, the way the leader does.
+//! A shred rebuilt by Reed-Solomon has no proof of its own, so this is how a rebuilt set is checked.
+//!
 //! The prefixes and the 20 byte cut follow Agave merkle_tree.rs and merkle.rs.
 
 use sha2::{Digest, Sha256};
@@ -41,12 +44,14 @@ pub fn shred_root(shred: &Shred) -> Result<Hash> {
     };
     let covered = shred.bytes.get(covered).ok_or_else(too_short)?;
     let proof = shred.bytes.get(parts.proof.clone()).ok_or_else(too_short)?;
-    root_from_proof(shred.shard_index, leaf(covered), proof)
+    root_from_proof(shred.shard_index, leaf(&[covered]), proof)
 }
 
-/// The leaf of a shred from the bytes it commits to.
-pub fn leaf(covered: &[u8]) -> Hash {
-    sha256(&[LEAF_PREFIX, covered])
+/// The leaf of a shred from the bytes it commits to, given in one or more parts.
+pub fn leaf(covered: &[&[u8]]) -> Hash {
+    let mut parts = vec![LEAF_PREFIX];
+    parts.extend_from_slice(covered);
+    sha256(&parts)
 }
 
 /// The root reached by climbing from a leaf at shard_index with its proof.
@@ -80,6 +85,23 @@ pub fn root_from_proof(shard_index: usize, leaf: Hash, proof: &[u8]) -> Result<H
 /// The parent of two sibling nodes, left first.
 pub fn join(left: &[u8; PROOF_ENTRY_SIZE], right: &[u8; PROOF_ENTRY_SIZE]) -> Hash {
     sha256(&[NODE_PREFIX, left, right])
+}
+
+/// The root of the tree over these leaves, None if there are none.
+/// Each level pairs neighbours, and a last node without a neighbour is paired with itself.
+pub fn tree_root(leaves: &[Hash]) -> Option<Hash> {
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| {
+                let left = entry(&pair[0]);
+                let right = pair.get(1).map_or(left, entry);
+                join(&left, &right)
+            })
+            .collect();
+    }
+    level.first().copied()
 }
 
 /// The first 20 bytes of a node, the part a parent joins.
@@ -124,9 +146,15 @@ mod tests {
     #[test]
     fn test_every_shred_of_a_set_climbs_to_one_root() {
         let root = shred_root(&set_shred(0)).unwrap();
+        let mut leaves = Vec::new();
         for i in 0..64 {
-            assert_eq!(shred_root(&set_shred(i)).unwrap(), root, "shard {i}");
+            let shred = set_shred(i);
+            assert_eq!(shred_root(&shred).unwrap(), root, "shard {i}");
+            let covered = wire::SIGNATURE.end..layout(shred.variant).unwrap().proof.start;
+            leaves.push(leaf(&[&shred.bytes[covered]]));
         }
+        // building the whole tree from the 64 leaves ends at the same root
+        assert_eq!(tree_root(&leaves), Some(root));
     }
 
     #[test]
@@ -168,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_bad_proofs() {
-        let l = leaf(b"x");
+        let l = leaf(&[b"x"]);
         // not whole entries
         assert!(matches!(
             root_from_proof(0, l, &[0u8; 30]),
