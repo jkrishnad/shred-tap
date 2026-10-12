@@ -2,7 +2,8 @@
 //!
 //! A set has 64 places, 32 data shards then 32 coding shards, filled by shard index as shreds arrive.
 //! push checks each shred belongs here, drops duplicates and keeps only its shard bytes.
-//! Belonging includes the Merkle proof, every shred must climb to the same root as the first one.
+//! Belonging includes the Merkle proof, every shred must climb to the same root as the first one,
+//! and carry the same signature, since the leader signs the root once for the whole set.
 //! Any 32 of the 64 are enough, so once 32 are in, recover fills the missing places.
 //! A rebuilt shard has no proof, so recover then builds the whole Merkle tree and checks its root.
 //! data_shards then hands the 32 data shards over in order for the block decoder.
@@ -33,6 +34,8 @@ pub struct FecSet {
     pub recovered: bool,
     /// Merkle root of the set, from the first shred that was let in.
     pub root: Option<Hash>,
+    /// The leader's signature over the root, the first 64 bytes of every shred of the set.
+    signature: Option<Vec<u8>>,
     /// Root of the previous set, the same in every shred of this one.
     chained_root: Option<Vec<u8>>,
     /// The first 89 bytes of a coding shred, signature and headers.
@@ -50,6 +53,7 @@ impl FecSet {
             decodable_ns: None,
             recovered: false,
             root: None,
+            signature: None,
             chained_root: None,
             coding_header: None,
         }
@@ -93,6 +97,19 @@ impl FecSet {
                 shard_index: shred.shard_index,
             });
         }
+        let signature = shred.bytes.get(wire::SIGNATURE).ok_or(Error::TooShort {
+            expected: wire::SIGNATURE.end,
+            actual: shred.bytes.len(),
+        })?;
+        if self
+            .signature
+            .as_deref()
+            .is_some_and(|expected| expected != signature)
+        {
+            return Err(Error::SignatureMismatch {
+                shard_index: shred.shard_index,
+            });
+        }
 
         if self.shards[shred.shard_index].is_some() {
             return Ok(false);
@@ -116,6 +133,7 @@ impl FecSet {
         }
         self.shards[shred.shard_index] = Some(bytes.to_vec());
         self.root.get_or_insert(root);
+        self.signature.get_or_insert_with(|| signature.to_vec());
         self.chained_root.get_or_insert_with(|| chained.to_vec());
 
         // t0 is the earliest arrival, even if shreds are pushed out of order

@@ -11,6 +11,8 @@
 use crate::block::{Batcher, Component, decode_component, is_last_in_slot};
 use crate::error::Error;
 use crate::fec::{DATA_SHREDS, FecSet, TOTAL_SHREDS};
+use crate::leaders::{LeaderSchedule, signed_by};
+use crate::merkle::shred_root;
 use crate::shred::{Kind, Shred};
 use crate::wire;
 use solana_transaction::Signature;
@@ -120,6 +122,10 @@ pub struct Stats {
     pub rejected: u64,
     /// Shreds whose Merkle proof does not climb to their FEC set's root, so they were changed or forged.
     pub bad_proof: u64,
+    /// Shreds not signed by their slot's leader, or signed differently from the rest of their set.
+    pub bad_signature: u64,
+    /// Shreds of slots the leader schedule doesn't cover, so their signature can't be checked.
+    pub no_leader: u64,
     /// Sets whose data shards went to the decoder.
     pub sets_decoded: u64,
     /// Of those, sets rebuilt with Reed-Solomon because some data shreds weren't in yet at t1.
@@ -177,6 +183,8 @@ pub struct Assembler {
     now_ns: u64,
     /// How long after its first shred a slot is given up on.
     give_up_ns: u64,
+    /// Who led each slot. Without it signatures are not checked.
+    leaders: Option<LeaderSchedule>,
     stats: Stats,
 }
 
@@ -199,8 +207,15 @@ impl Assembler {
             closed: BTreeMap::new(),
             now_ns: 0,
             give_up_ns: DELTA_TIMEOUT_NS + LEADER_WINDOW_SLOTS * slot_ns + DELTA_NS,
+            leaders: None,
             stats: Stats::default(),
         }
+    }
+
+    /// Checks every FEC set's signature against its slot's leader from this schedule.
+    pub fn with_leaders(mut self, leaders: LeaderSchedule) -> Self {
+        self.leaders = Some(leaders);
+        self
     }
 
     /// Feeds one UDP payload. Returns whatever this packet made decodable.
@@ -259,6 +274,21 @@ impl Assembler {
             return events;
         }
 
+        // the first shred of a set decides its root, so it must be signed by the slot's leader.
+        // The rest only have to match it, one signature check per set like Agave's cache
+        if let Some(leaders) = &self.leaders
+            && !state.sets.contains_key(&shred.fec_set_index)
+        {
+            let Some(leader) = leaders.leader(slot) else {
+                self.stats.no_leader += 1;
+                return events;
+            };
+            if !shred_root(&shred).is_ok_and(|root| signed_by(&shred, &root, leader)) {
+                self.stats.bad_signature += 1;
+                return events;
+            }
+        }
+
         let set = state
             .sets
             .entry(shred.fec_set_index)
@@ -267,6 +297,10 @@ impl Assembler {
             Ok(_) => {}
             Err(Error::InvalidMerkleProof { .. } | Error::MerkleRootMismatch { .. }) => {
                 self.stats.bad_proof += 1;
+                return events;
+            }
+            Err(Error::SignatureMismatch { .. }) => {
+                self.stats.bad_signature += 1;
                 return events;
             }
             Err(_) => {
@@ -722,6 +756,52 @@ mod tests {
         assert_eq!(signatures(&events).len(), 26);
     }
 
+    // From solana leader-schedule for testnet epoch 1053, covering every slot of real-10s.pcap.
+    const LEADERS: &str = include_str!("../tests/fixtures/real-leaders.txt");
+
+    fn leaders() -> LeaderSchedule {
+        let mut schedule = LeaderSchedule::default();
+        schedule.read(LEADERS.as_bytes()).unwrap();
+        schedule
+    }
+
+    fn run_with(asm: &mut Assembler, packets: &[(u64, &[u8])]) -> Vec<Event> {
+        packets.iter().flat_map(|(t, p)| asm.push(p, *t)).collect()
+    }
+
+    #[test]
+    fn test_signatures_checked_against_the_leader() {
+        let mut asm = Assembler::new().with_leaders(leaders());
+        let events = run_with(&mut asm, &arrivals());
+        assert_eq!(signatures(&events).len(), 26);
+        assert_eq!(asm.stats().bad_signature, 0);
+        assert_eq!(asm.stats().no_leader, 0);
+
+        // a schedule that doesn't cover the slot lets nothing in
+        let mut asm = Assembler::new().with_leaders(LeaderSchedule::default());
+        assert!(signatures(&run_with(&mut asm, &arrivals())).is_empty());
+        assert_eq!(asm.stats().no_leader, 255);
+    }
+
+    #[test]
+    fn test_forged_first_shred_dropped() {
+        // a changed copy of set 0's first shred arrives before everything else
+        let mut forged = arrivals()[0].1.to_vec();
+        forged[200] ^= 1;
+        let mut packets = vec![(arrivals()[0].0, &forged[..])];
+        packets.extend(arrivals());
+
+        // without a schedule it decides set 0's root and the real shreds of set 0 are refused
+        let mut asm = Assembler::new();
+        assert!(signatures(&run_with(&mut asm, &packets)).len() < 26);
+
+        // with one its signature fails, so it never gets in and the slot decodes as usual
+        let mut asm = Assembler::new().with_leaders(leaders());
+        assert_eq!(signatures(&run_with(&mut asm, &packets)).len(), 26);
+        assert_eq!(asm.stats().bad_signature, 1);
+        assert_eq!(asm.stats().bad_proof, 0);
+    }
+
     #[test]
     fn test_duplicate_after_decode() {
         // set 0 decodes from its first 32 shreds, then a copy of one of them arrives
@@ -1085,7 +1165,7 @@ mod tests {
             return;
         };
         let mut reader = PcapReader::new(std::io::BufReader::new(file)).unwrap();
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::new().with_leaders(leaders());
         let mut txs = 0;
         while let Some(rec) = reader.next_record().unwrap() {
             if let Some(payload) = udp_payload(&rec.frame) {
@@ -1099,8 +1179,10 @@ mod tests {
         assert_eq!(s.slots_complete, 45);
         assert_eq!(s.sets_decoded, 246);
         assert_eq!(s.decode_errors, 0);
-        // every real shred climbs to its set's root
+        // every real shred climbs to its set's root, and every set is signed by its slot's leader
         assert_eq!(s.bad_proof, 0);
+        assert_eq!(s.bad_signature, 0);
+        assert_eq!(s.no_leader, 0);
         assert_eq!(txs, 2_394);
         assert_eq!(s.txs, 2_394);
     }

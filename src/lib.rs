@@ -6,6 +6,7 @@
 //! 3. shred checks a packet once and works out its kind, its place in the FEC set and its byte layout.
 //! 4. fec collects the shreds of one FEC set and rebuilds missing data shards with Reed-Solomon.
 //!    merkle climbs a shred's Merkle proof to its set's root, to check the shred belongs there.
+//!    leaders reads the leader schedule and checks the leader's signature on that root.
 //! 5. block joins data shards into batches and decodes them into entries or block markers.
 //! 6. assembler runs all of the above on a live or recorded stream, in the right order, with timing.
 //! 7. record writes the assembler's events as JSON lines and the run's totals as a summary.
@@ -15,6 +16,7 @@ pub mod assembler;
 pub mod block;
 pub mod error;
 pub mod fec;
+pub mod leaders;
 pub mod merkle;
 pub mod pcap;
 pub mod record;

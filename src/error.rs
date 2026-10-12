@@ -52,6 +52,9 @@ pub enum Error {
     /// The tree built from a rebuilt set does not end at the set's root, so the rebuild is wrong.
     #[error("rebuilt fec set does not match its merkle root")]
     RebuiltRootMismatch,
+    /// Shred whose signature differs from the rest of its FEC set, which all carry the leader's one signature.
+    #[error("signature of shard index {shard_index} does not match its fec set")]
+    SignatureMismatch { shard_index: usize },
     /// Entry batch bytes that don't decode as entries.
     #[error("entry decode failed: {0}")]
     Decode(#[from] wincode::ReadError),

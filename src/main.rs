@@ -2,6 +2,7 @@
 //!
 //! decode reads a pcap capture, from a file or from stdin when the input is "-",
 //! runs every packet through the assembler and writes the events and a summary into a folder.
+//! With --leader-schedule it also checks every FEC set's signature against its slot's leader.
 //! All the work happens in the library, this file only parses arguments and reports errors.
 
 use std::fs::File;
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use shredtap::assembler::{Assembler, DEFAULT_SLOT_NS, Stats};
+use shredtap::leaders::LeaderSchedule;
 use shredtap::pcap::{PcapReader, udp_payload};
 use shredtap::record::{Output, write_summary};
 
@@ -36,6 +38,9 @@ enum Command {
         /// Slot duration in milliseconds, it sets when an unfinished slot is given up on
         #[arg(long, default_value_t = DEFAULT_SLOT_NS / 1_000_000)]
         slot_ms: u64,
+        /// Output of solana leader-schedule, repeat it for a capture that spans epochs
+        #[arg(long)]
+        leader_schedule: Vec<PathBuf>,
     },
 }
 
@@ -45,11 +50,12 @@ fn main() -> Result<()> {
             input,
             out,
             slot_ms,
-        } => decode(&input, &out, slot_ms),
+            leader_schedule,
+        } => decode(&input, &out, slot_ms, &leader_schedule),
     }
 }
 
-fn decode(input: &Path, out: &Path, slot_ms: u64) -> Result<()> {
+fn decode(input: &Path, out: &Path, slot_ms: u64, schedules: &[PathBuf]) -> Result<()> {
     let source: Box<dyn Read> = if input == Path::new("-") {
         Box::new(io::stdin().lock())
     } else {
@@ -63,6 +69,17 @@ fn decode(input: &Path, out: &Path, slot_ms: u64) -> Result<()> {
     let mut output =
         Output::create(out).with_context(|| format!("creating output in {}", out.display()))?;
     let mut assembler = Assembler::with_slot_duration_ns(slot_ms * 1_000_000);
+    if !schedules.is_empty() {
+        let mut leaders = LeaderSchedule::default();
+        for path in schedules {
+            let file = File::open(path)
+                .with_context(|| format!("opening leader schedule {}", path.display()))?;
+            leaders
+                .read(BufReader::new(file))
+                .with_context(|| format!("reading leader schedule {}", path.display()))?;
+        }
+        assembler = assembler.with_leaders(leaders);
+    }
 
     while let Some(record) = pcap.next_record().context("reading capture")? {
         if let Some(payload) = udp_payload(&record.frame) {
@@ -96,6 +113,10 @@ fn print_summary(stats: &Stats, out: &Path) {
         stats.sets_rebuilt_at_t1,
         stats.sets_data_never_complete,
         stats.sets_lost
+    );
+    println!(
+        "{} bad proofs, {} bad signatures, {} with no known leader",
+        stats.bad_proof, stats.bad_signature, stats.no_leader
     );
     println!("output in {}", out.display());
 }
