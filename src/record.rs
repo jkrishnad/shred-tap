@@ -24,6 +24,7 @@ struct TxRecord {
     t0_ns: u64,
     t1_ns: u64,
     t2_ns: u64,
+    rebuilt: bool,
 }
 
 /// One line of markers.jsonl. The marker bytes are not written, only their length.
@@ -36,16 +37,19 @@ struct MarkerRecord {
     t0_ns: u64,
     t1_ns: u64,
     t2_ns: u64,
+    rebuilt: bool,
 }
 
 /// One line of sets.jsonl. t1_ns is null for a set that never reached 32 shreds.
+/// rebuilt lists the data shards Reed-Solomon filled, by place in the set.
 #[derive(Serialize)]
-struct SetRecord {
+struct SetRecord<'a> {
     slot: u64,
     fec_set: u32,
     t0_ns: u64,
     t1_ns: Option<u64>,
     data_at_decode: u64,
+    rebuilt: &'a [u8],
     decoded: bool,
 }
 
@@ -88,6 +92,7 @@ impl<W: Write> Output<W> {
                 slot,
                 signature,
                 timing,
+                rebuilt,
             } => {
                 let Timing {
                     fec_set_index,
@@ -102,6 +107,7 @@ impl<W: Write> Output<W> {
                     t0_ns: first_shred_ns,
                     t1_ns: decodable_ns,
                     t2_ns: decoded_ns,
+                    rebuilt: *rebuilt,
                 };
                 write_line(&mut self.tx, &record)
             }
@@ -110,6 +116,7 @@ impl<W: Write> Output<W> {
                 variant,
                 data,
                 timing,
+                rebuilt,
             } => {
                 let record = MarkerRecord {
                     slot: *slot,
@@ -119,6 +126,7 @@ impl<W: Write> Output<W> {
                     t0_ns: timing.first_shred_ns,
                     t1_ns: timing.decodable_ns,
                     t2_ns: timing.decoded_ns,
+                    rebuilt: *rebuilt,
                 };
                 write_line(&mut self.markers, &record)
             }
@@ -128,6 +136,7 @@ impl<W: Write> Output<W> {
                 first_shred_ns,
                 decodable_ns,
                 data_at_decode,
+                rebuilt,
                 decoded,
             } => {
                 let record = SetRecord {
@@ -136,6 +145,7 @@ impl<W: Write> Output<W> {
                     t0_ns: *first_shred_ns,
                     t1_ns: *decodable_ns,
                     data_at_decode: *data_at_decode,
+                    rebuilt,
                     decoded: *decoded,
                 };
                 write_line(&mut self.sets, &record)
@@ -248,12 +258,13 @@ mod tests {
             slot: 449_661_788,
             signature: Signature::from_str(SIG).unwrap(),
             timing: timing(),
+            rebuilt: false,
         })
         .unwrap();
         assert_eq!(
             lines(&out.tx),
             [format!(
-                r#"{{"slot":449661788,"sig":"{SIG}","fec_set":32,"t0_ns":100,"t1_ns":150,"t2_ns":160}}"#
+                r#"{{"slot":449661788,"sig":"{SIG}","fec_set":32,"t0_ns":100,"t1_ns":150,"t2_ns":160,"rebuilt":false}}"#
             )]
         );
         assert!(out.markers.is_empty());
@@ -269,12 +280,13 @@ mod tests {
             variant: 0,
             data: vec![0u8; 670],
             timing: timing(),
+            rebuilt: true,
         })
         .unwrap();
         assert_eq!(
             lines(&out.markers),
             [
-                r#"{"slot":449661788,"variant":0,"len":670,"fec_set":32,"t0_ns":100,"t1_ns":150,"t2_ns":160}"#
+                r#"{"slot":449661788,"variant":0,"len":670,"fec_set":32,"t0_ns":100,"t1_ns":150,"t2_ns":160,"rebuilt":true}"#
             ]
         );
         assert!(out.tx.is_empty());
@@ -289,6 +301,7 @@ mod tests {
             first_shred_ns: 100,
             decodable_ns: Some(150),
             data_at_decode: 28,
+            rebuilt: vec![3, 10, 17, 31],
             decoded: true,
         })
         .unwrap();
@@ -298,15 +311,16 @@ mod tests {
             first_shred_ns: 120,
             decodable_ns: None,
             data_at_decode: 16,
+            rebuilt: Vec::new(),
             decoded: false,
         })
         .unwrap();
         assert_eq!(
             lines(&out.sets),
             [
-                r#"{"slot":449661788,"fec_set":32,"t0_ns":100,"t1_ns":150,"data_at_decode":28,"decoded":true}"#,
+                r#"{"slot":449661788,"fec_set":32,"t0_ns":100,"t1_ns":150,"data_at_decode":28,"rebuilt":[3,10,17,31],"decoded":true}"#,
                 // a set that never reached 32 shreds has no t1
-                r#"{"slot":449661788,"fec_set":64,"t0_ns":120,"t1_ns":null,"data_at_decode":16,"decoded":false}"#,
+                r#"{"slot":449661788,"fec_set":64,"t0_ns":120,"t1_ns":null,"data_at_decode":16,"rebuilt":[],"decoded":false}"#,
             ]
         );
     }
@@ -354,6 +368,7 @@ mod tests {
                 slot: 1,
                 signature: Signature::from_str(SIG).unwrap(),
                 timing: timing(),
+                rebuilt: false,
             })
             .unwrap();
         }
@@ -387,6 +402,7 @@ mod tests {
             slot: 1,
             signature: Signature::from_str(SIG).unwrap(),
             timing: timing(),
+            rebuilt: false,
         })
         .unwrap();
         out.flush().unwrap();

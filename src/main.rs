@@ -104,8 +104,8 @@ fn decode(input: &Path, out: &Path, slot_ms: u64, schedules: &[PathBuf]) -> Resu
 
 fn print_summary(stats: &Stats, out: &Path) {
     println!(
-        "{} packets, {} slots complete, {} transactions",
-        stats.packets, stats.slots_complete, stats.txs
+        "{} packets, {} slots complete, {} transactions, {} from rebuilt shreds",
+        stats.packets, stats.slots_complete, stats.txs, stats.txs_rebuilt
     );
     println!(
         "{} sets decoded, {} rebuilt at t1, {} never got all data, {} lost",

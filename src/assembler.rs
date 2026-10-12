@@ -3,9 +3,11 @@
 //! push takes one packet, parses it and puts the shred into its FEC set.
 //! A set decodes as soon as it has 32 shreds, the earliest moment the data can be known.
 //! Sets go to the slot's Batcher strictly in order, because a batch can start in one set and end in the next.
-//! Each finished batch is decoded and handed out as events, one per transaction or marker.
-//! A slot closes when its last shred is decoded, or when its Alpenglow skip deadline has passed
-//! on the capture clock, 1.45 s after its first shred with 200 ms slots.
+//! Each finished batch is decoded into events, one per transaction or marker.
+//! A slot ends when its last shred is decoded, but it closes only when its Alpenglow skip deadline
+//! has passed on the capture clock, 1.45 s after its first shred with 200 ms slots.
+//! Data shreds keep arriving after a slot ends, and the slot's events are held until it closes,
+//! so they can say which data shreds never arrived and only exist because Reed-Solomon rebuilt them.
 //! Every event carries t0 (first shred of the set), t1 (32nd shred) and t2 (the batch could decode).
 
 use crate::block::{Batcher, Component, decode_component, is_last_in_slot};
@@ -17,6 +19,7 @@ use crate::shred::{Kind, Shred};
 use crate::wire;
 use solana_transaction::Signature;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 
 // Alpenglow timing, from Agave votor/src/common.rs and timer_manager/timers.rs.
 // A validator votes skip on slot i of a leader window at
@@ -57,6 +60,8 @@ pub enum Event {
         slot: u64,
         signature: Signature,
         timing: Timing,
+        /// Its batch holds a data shred that never arrived, so part of it was only rebuilt.
+        rebuilt: bool,
     },
     /// A block marker, variant 0 footer, 1 header, 2 update parent, 3 genesis certificate.
     Marker {
@@ -64,6 +69,8 @@ pub enum Event {
         variant: u8,
         data: Vec<u8>,
         timing: Timing,
+        /// Its batch holds a data shred that never arrived, so part of it was only rebuilt.
+        rebuilt: bool,
     },
     /// One FEC set, either decoded or given up on. Comes before anything decoded from it.
     Set {
@@ -76,6 +83,9 @@ pub enum Event {
         /// Data shreds the set held when it was decoded or given up on.
         /// Below 32 on a decoded set means Reed-Solomon rebuilt the rest.
         data_at_decode: u64,
+        /// Data shreds that never arrived by the time the slot closed, by place in the set.
+        /// Their bytes only exist because Reed-Solomon rebuilt them. Empty for a lost set.
+        rebuilt: Vec<u8>,
         /// False when the set was given up on.
         decoded: bool,
     },
@@ -131,8 +141,8 @@ pub struct Stats {
     /// Of those, sets rebuilt with Reed-Solomon because some data shreds weren't in yet at t1.
     /// Most of those data shreds still arrive later, so this is not loss.
     pub sets_rebuilt_at_t1: u64,
-    /// Decoded sets whose 32 data shreds never all arrived, real data loss on the wire.
-    /// Counted when a closed slot is forgotten or at finish, since late shreds can still fill a set.
+    /// Decoded sets whose 32 data shreds had not all arrived when their slot closed,
+    /// real data loss on the wire.
     pub sets_data_never_complete: u64,
     /// Sets that never reached 32 shreds, or waited behind one that didn't.
     pub sets_lost: u64,
@@ -142,6 +152,8 @@ pub struct Stats {
     pub slots_complete: u64,
     /// Transactions handed out, one per first signature.
     pub txs: u64,
+    /// Of those, transactions whose batch holds a data shred that never arrived.
+    pub txs_rebuilt: u64,
     /// Block markers handed out.
     pub markers: u64,
 }
@@ -151,7 +163,6 @@ pub struct Stats {
 struct Seen {
     /// Bit i is set once shard index i has arrived, data at bits 0..32 and coding at 32..64.
     shreds: u64,
-    decoded: bool,
 }
 
 /// Everything in flight for one slot.
@@ -170,8 +181,14 @@ struct SlotState {
     footer: bool,
     /// When the slot's latest batch decoded.
     done_ns: Option<u64>,
+    /// Index of the first data shred of the batch being filled.
+    batch_start: Option<u32>,
+    /// Events held until the slot closes, each transaction and marker with the data shreds of its batch.
+    pending: Vec<(Event, Range<u32>)>,
     /// Shreds seen per set, by fec_set_index.
     seen: BTreeMap<u32, Seen>,
+    /// Set once the slot is decoded or can't be, it then only records late shreds until it closes.
+    ended: Option<SlotEnd>,
 }
 
 pub struct Assembler {
@@ -230,7 +247,7 @@ impl Assembler {
 
         // time moves on even for a shred we end up dropping
         self.now_ns = self.now_ns.max(recv_ns);
-        let mut events = self.give_up_expired_slots();
+        let events = self.give_up_expired_slots();
 
         let Some(bit) = shard_bit(&shred) else {
             self.stats.rejected += 1;
@@ -239,13 +256,7 @@ impl Assembler {
 
         // the seen bits are checked first, so a copy is a duplicate however late it comes
         if let Some(sets) = self.closed.get_mut(&slot) {
-            let seen = sets.entry(shred.fec_set_index).or_default();
-            if seen.shreds & bit != 0 {
-                self.stats.duplicates += 1;
-            } else {
-                seen.shreds |= bit;
-                self.stats.after_slot_done += 1;
-            }
+            seen_late(sets, shred.fec_set_index, bit, &mut self.stats);
             return events;
         }
 
@@ -259,8 +270,15 @@ impl Assembler {
             txs: 0,
             footer: false,
             done_ns: None,
+            batch_start: None,
+            pending: Vec::new(),
             seen: BTreeMap::new(),
+            ended: None,
         });
+        if state.ended.is_some() {
+            seen_late(&mut state.seen, shred.fec_set_index, bit, &mut self.stats);
+            return events;
+        }
         state.first_seen_ns = state.first_seen_ns.min(recv_ns);
         let seen = state.seen.entry(shred.fec_set_index).or_default();
         if seen.shreds & bit != 0 {
@@ -310,18 +328,18 @@ impl Assembler {
         }
         seen.shreds |= bit;
 
-        events.extend(self.drain(slot, recv_ns));
+        self.drain(slot, recv_ns);
         events
     }
 
     /// Hands every rebuildable set, in order, to the slot's batcher and decodes finished batches.
-    fn drain(&mut self, slot: u64, now_ns: u64) -> Vec<Event> {
-        let mut events = Vec::new();
+    /// What it decodes is held in the slot until the slot closes.
+    fn drain(&mut self, slot: u64, now_ns: u64) {
         let mut slot_done = false;
         let mut end = SlotEnd::GivenUp;
 
         let Some(state) = self.slots.get_mut(&slot) else {
-            return events;
+            return;
         };
 
         while let Some(set) = state.sets.get_mut(&state.next_set) {
@@ -338,18 +356,21 @@ impl Assembler {
             if set.recover().is_err() {
                 self.stats.sets_lost += 1;
                 state.sets_lost += 1;
-                events.push(set_event(&set, data_at_decode, false));
+                state
+                    .pending
+                    .push((set_event(&set, data_at_decode, false), 0..0));
                 // later sets can't be decoded without this one's bytes
                 slot_done = true;
                 break;
             }
             self.stats.sets_decoded += 1;
             state.sets_decoded += 1;
-            state.seen.entry(set.fec_set_index).or_default().decoded = true;
             if set.recovered {
                 self.stats.sets_rebuilt_at_t1 += 1;
             }
-            events.push(set_event(&set, data_at_decode, true));
+            state
+                .pending
+                .push((set_event(&set, data_at_decode, true), 0..0));
 
             let timing = Timing {
                 fec_set_index: set.fec_set_index,
@@ -364,7 +385,8 @@ impl Assembler {
                 slot_done = true;
                 break;
             };
-            for shard in shards {
+            for (i, shard) in (set.fec_set_index..).zip(shards) {
+                let start = *state.batch_start.get_or_insert(i);
                 let batch = match state.batcher.push(shard) {
                     Ok(Some(batch)) => batch,
                     Ok(None) => continue,
@@ -374,16 +396,18 @@ impl Assembler {
                     }
                 };
                 self.stats.batches += 1;
+                state.batch_start = None;
                 match decode_component(&batch) {
                     Ok(component) => {
-                        let before = events.len();
-                        push_events(&mut events, &mut self.stats, slot, component, timing);
-                        for event in &events[before..] {
+                        let mut decoded = Vec::new();
+                        push_events(&mut decoded, &mut self.stats, slot, component, timing);
+                        for event in decoded {
                             match event {
                                 Event::Tx { .. } => state.txs += 1,
                                 Event::Marker { variant: 0, .. } => state.footer = true,
                                 _ => {}
                             }
+                            state.pending.push((event, start..i + 1));
                         }
                         state.done_ns = Some(now_ns);
                     }
@@ -401,12 +425,11 @@ impl Assembler {
         }
 
         if slot_done {
-            events.extend(self.close(slot, end));
+            state.ended = Some(end);
         }
-        events
     }
 
-    /// Gives up on every slot whose deadline has passed on the capture clock.
+    /// Closes every slot whose deadline has passed on the capture clock, giving up on the ones still open.
     fn give_up_expired_slots(&mut self) -> Vec<Event> {
         let mut expired: Vec<u64> = self
             .slots
@@ -423,19 +446,51 @@ impl Assembler {
         events
     }
 
-    /// Drops a slot's state. Every set it never decoded is handed out as lost, then the slot itself.
+    /// Drops a slot's state. Hands out its held events, marked with the data shreds that never arrived,
+    /// then every set it never decoded as lost, then the slot itself.
     fn close(&mut self, slot: u64, end: SlotEnd) -> Vec<Event> {
         let Some(mut state) = self.slots.remove(&slot) else {
             self.remember_closed(slot, BTreeMap::new());
             return Vec::new();
         };
-        self.remember_closed(slot, std::mem::take(&mut state.seen));
+        let end = state.ended.unwrap_or(end);
+        let seen = std::mem::take(&mut state.seen);
+        let arrived = |index: u32| {
+            let place = index % DATA_SHREDS as u32;
+            seen.get(&(index - place))
+                .is_some_and(|s| s.shreds & 1 << place != 0)
+        };
+        let mut events = Vec::with_capacity(state.pending.len() + state.sets.len() + 1);
+        for (mut event, mut shreds) in std::mem::take(&mut state.pending) {
+            match &mut event {
+                Event::Set {
+                    fec_set_index,
+                    rebuilt,
+                    decoded: true,
+                    ..
+                } => {
+                    *rebuilt = (0..DATA_SHREDS as u8)
+                        .filter(|place| !arrived(*fec_set_index + u32::from(*place)))
+                        .collect();
+                    self.stats.sets_data_never_complete += u64::from(!rebuilt.is_empty());
+                }
+                Event::Tx { rebuilt, .. } => {
+                    *rebuilt = !shreds.all(arrived);
+                    self.stats.txs_rebuilt += u64::from(*rebuilt);
+                }
+                Event::Marker { rebuilt, .. } => *rebuilt = !shreds.all(arrived),
+                _ => {}
+            }
+            events.push(event);
+        }
+        self.remember_closed(slot, seen);
         self.stats.sets_lost += state.sets.len() as u64;
-        let mut events: Vec<Event> = state
-            .sets
-            .values()
-            .map(|set| set_event(set, set.data_received() as u64, false))
-            .collect();
+        events.extend(
+            state
+                .sets
+                .values()
+                .map(|set| set_event(set, set.data_received() as u64, false)),
+        );
         events.push(Event::Slot {
             slot,
             first_shred_ns: state.first_seen_ns,
@@ -454,13 +509,11 @@ impl Assembler {
     fn remember_closed(&mut self, slot: u64, seen: BTreeMap<u32, Seen>) {
         self.closed.insert(slot, seen);
         while self.closed.len() > CLOSED_SLOTS_KEPT {
-            if let Some((_, sets)) = self.closed.pop_first() {
-                self.stats.sets_data_never_complete += data_never_complete(&sets);
-            }
+            self.closed.pop_first();
         }
     }
 
-    /// End of input. Every set still waiting is given up on, and handed out as lost.
+    /// End of input. Every slot is closed, and every set still waiting is handed out as lost.
     pub fn finish(&mut self) -> Vec<Event> {
         let mut slots: Vec<u64> = self.slots.keys().copied().collect();
         slots.sort_unstable();
@@ -468,16 +521,23 @@ impl Assembler {
         for slot in slots {
             events.extend(self.close(slot, SlotEnd::EndOfInput));
         }
-        // no more shreds can come, so every remembered set is final now
-        for sets in self.closed.values_mut() {
-            self.stats.sets_data_never_complete += data_never_complete(&std::mem::take(sets));
-        }
         events
     }
 
     /// Counters so far.
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+}
+
+/// Counts a shred that came after its slot ended, as a duplicate or as a first copy.
+fn seen_late(sets: &mut BTreeMap<u32, Seen>, fec_set_index: u32, bit: u64, stats: &mut Stats) {
+    let seen = sets.entry(fec_set_index).or_default();
+    if seen.shreds & bit != 0 {
+        stats.duplicates += 1;
+    } else {
+        seen.shreds |= bit;
+        stats.after_slot_done += 1;
     }
 }
 
@@ -509,14 +569,7 @@ fn shard_bit(shred: &Shred) -> Option<u64> {
         .then(|| 1u64 << shred.shard_index)
 }
 
-/// Decoded sets of one slot that never got all 32 data shreds, the low 32 seen bits.
-fn data_never_complete(sets: &BTreeMap<u32, Seen>) -> u64 {
-    sets.values()
-        .filter(|seen| seen.decoded && (seen.shreds as u32) != u32::MAX)
-        .count() as u64
-}
-
-/// The Set event for a set, decoded or not.
+/// The Set event for a set, decoded or not. Its rebuilt shreds are filled in when the slot closes.
 fn set_event(set: &FecSet, data_at_decode: u64, decoded: bool) -> Event {
     Event::Set {
         slot: set.slot,
@@ -524,6 +577,7 @@ fn set_event(set: &FecSet, data_at_decode: u64, decoded: bool) -> Event {
         first_shred_ns: set.first_seen_ns.unwrap_or(0),
         decodable_ns: set.decodable_ns,
         data_at_decode,
+        rebuilt: Vec::new(),
         decoded,
     }
 }
@@ -546,6 +600,7 @@ fn push_events(
                             slot,
                             signature: *signature,
                             timing,
+                            rebuilt: false,
                         });
                     }
                 }
@@ -558,6 +613,7 @@ fn push_events(
                 variant,
                 data,
                 timing,
+                rebuilt: false,
             });
         }
     }
@@ -604,6 +660,13 @@ mod tests {
         (asm, events)
     }
 
+    // run, then the end of input, which closes the slot and hands out its events
+    fn run_to_end(packets: &[(u64, &[u8])]) -> (Assembler, Vec<Event>) {
+        let (mut asm, mut events) = run(packets);
+        events.extend(asm.finish());
+        (asm, events)
+    }
+
     fn signatures(events: &[Event]) -> Vec<String> {
         events
             .iter()
@@ -626,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_real_arrival_order() {
-        let (asm, events) = run(&arrivals());
+        let (asm, events) = run_to_end(&arrivals());
         let sigs = signatures(&events);
         assert_eq!(sigs.len(), 26);
         assert_eq!(sigs.first().unwrap(), FIRST_SIG);
@@ -648,7 +711,7 @@ mod tests {
         // the last set completes first, nothing may decode until set 0 is in
         let mut packets = arrivals();
         packets.reverse();
-        let (_, events) = run(&packets);
+        let (_, events) = run_to_end(&packets);
         let sigs = signatures(&events);
         assert_eq!(sigs.len(), 26);
         assert_eq!(sigs.first().unwrap(), FIRST_SIG);
@@ -670,6 +733,7 @@ mod tests {
         for (t, p) in packets.iter().filter(|(_, p)| set0(p)) {
             late.extend(asm.push(p, *t));
         }
+        late.extend(asm.finish());
         assert_eq!(signatures(&late).len(), 26);
     }
 
@@ -683,13 +747,43 @@ mod tests {
                 !(is_data(p) && (40..50).contains(&index))
             })
             .collect();
-        let (mut asm, events) = run(&packets);
+        let (mut asm, events) = run_to_end(&packets);
         assert_eq!(signatures(&events).len(), 26);
         assert_eq!(asm.stats().sets_decoded, 4);
         assert_eq!(asm.stats().sets_lost, 0);
+        // set 32 says which places were rebuilt, and the transactions they carried say so too
+        let Some(Event::Set { rebuilt, .. }) = events.iter().find(|e| {
+            matches!(
+                e,
+                Event::Set {
+                    fec_set_index: 32,
+                    ..
+                }
+            )
+        }) else {
+            unreachable!()
+        };
+        assert!((8..18).all(|i| rebuilt.contains(&i)));
+        assert!(asm.stats().txs_rebuilt > 0);
         // those 10 never arrive, so set 32 never had all its data
         asm.finish();
         assert_eq!(asm.stats().sets_data_never_complete, 1);
+    }
+
+    #[test]
+    fn test_nothing_rebuilt_when_data_comes_first() {
+        let mut packets = arrivals();
+        packets.sort_by_key(|(_, p)| (!is_data(p), wire::index(p).unwrap()));
+        let (asm, events) = run_to_end(&packets);
+        assert_eq!(signatures(&events).len(), 26);
+        assert_eq!(asm.stats().txs_rebuilt, 0);
+        for e in &events {
+            match e {
+                Event::Set { rebuilt, .. } => assert!(rebuilt.is_empty()),
+                Event::Tx { rebuilt, .. } | Event::Marker { rebuilt, .. } => assert!(!rebuilt),
+                Event::Slot { .. } => {}
+            }
+        }
     }
 
     #[test]
@@ -715,7 +809,7 @@ mod tests {
         packets.insert(7, (0, cut));
         packets.insert(9, (0, &[][..]));
 
-        let (asm, events) = run(&packets);
+        let (asm, events) = run_to_end(&packets);
         assert_eq!(signatures(&events).len(), 26);
         let s = asm.stats();
         assert_eq!(s.not_shreds, 3);
@@ -750,6 +844,7 @@ mod tests {
         for (t, p) in &packets {
             events.extend(asm.push(p, *t));
         }
+        events.extend(asm.finish());
         assert_eq!(asm.stats().bad_proof, 1);
         assert_eq!(asm.stats().rejected, 0);
         // the set still has 63 good shreds, so the slot decodes as before
@@ -766,7 +861,9 @@ mod tests {
     }
 
     fn run_with(asm: &mut Assembler, packets: &[(u64, &[u8])]) -> Vec<Event> {
-        packets.iter().flat_map(|(t, p)| asm.push(p, *t)).collect()
+        let mut events: Vec<Event> = packets.iter().flat_map(|(t, p)| asm.push(p, *t)).collect();
+        events.extend(asm.finish());
+        events
     }
 
     #[test]
@@ -824,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_timing() {
-        let (_, events) = run(&arrivals());
+        let (_, events) = run_to_end(&arrivals());
         for e in &events {
             if let Event::Tx { timing, .. } | Event::Marker { timing, .. } = e {
                 assert!(timing.first_shred_ns <= timing.decodable_ns);
@@ -926,20 +1023,20 @@ mod tests {
         junk[65..73].copy_from_slice(&u64::MAX.to_le_bytes());
         let mut packets = vec![(arrivals()[0].0, &junk[..])];
         packets.extend(arrivals());
-        let (mut asm, events) = run(&packets);
+        let (mut asm, mut events) = run(&packets);
+        // both slots close once their deadline passes, the junk one given up on
+        let last = arrivals().iter().map(|(t, _)| *t).max().unwrap();
+        events.extend(tick(&mut asm, last + 1_500_000_000));
         assert_eq!(signatures(&events).len(), 26);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Set { slot: u64::MAX, .. }))
+        );
         // the real slot is handled exactly as without the junk shred
         let (clean, _) = run(&arrivals());
         assert_eq!(asm.stats().after_slot_done, clean.stats().after_slot_done);
         assert_eq!(asm.stats().sets_decoded, clean.stats().sets_decoded);
-
-        // the junk slot itself is given up on once its deadline passes
-        let last = arrivals().iter().map(|(t, _)| *t).max().unwrap();
-        let lost = tick(&mut asm, last + 1_500_000_000);
-        assert!(
-            lost.iter()
-                .any(|e| matches!(e, Event::Set { slot: u64::MAX, .. }))
-        );
     }
 
     #[test]
@@ -977,7 +1074,7 @@ mod tests {
 
     #[test]
     fn test_set_event_per_decoded_set() {
-        let (asm, events) = run(&arrivals());
+        let (asm, events) = run_to_end(&arrivals());
         let sets = set_events(&events);
         assert_eq!(sets.len(), 4);
         let mut indexes = Vec::new();
@@ -988,6 +1085,7 @@ mod tests {
                 first_shred_ns,
                 decodable_ns,
                 data_at_decode,
+                rebuilt,
                 decoded,
             } = e
             else {
@@ -996,7 +1094,8 @@ mod tests {
             assert_eq!(*slot, SLOT);
             assert!(*decoded);
             assert!(decodable_ns.unwrap() >= *first_shred_ns);
-            assert!(*data_at_decode <= 32);
+            // a shred that never arrived was also missing at decode
+            assert!(rebuilt.len() <= 32 - *data_at_decode as usize);
             indexes.push(*fec_set_index);
         }
         assert_eq!(indexes, [0, 32, 64, 96]);
@@ -1007,7 +1106,7 @@ mod tests {
     #[test]
     fn test_set_event_comes_before_its_transactions() {
         // a reader of the event stream learns about the set before what was decoded from it
-        let (_, events) = run(&arrivals());
+        let (_, events) = run_to_end(&arrivals());
         let first_set = events.iter().position(|e| matches!(e, Event::Set { .. }));
         let first_other = events.iter().position(|e| !matches!(e, Event::Set { .. }));
         assert!(first_set.unwrap() < first_other.unwrap());
@@ -1052,7 +1151,7 @@ mod tests {
 
     #[test]
     fn test_slot_event_complete() {
-        let (_, events) = run(&arrivals());
+        let (_, events) = run_to_end(&arrivals());
         let slots: Vec<_> = events
             .iter()
             .filter(|e| matches!(e, Event::Slot { .. }))
@@ -1172,7 +1271,7 @@ mod tests {
                 txs += signatures(&asm.push(payload, rec.recv_ns)).len();
             }
         }
-        asm.finish();
+        txs += signatures(&asm.finish()).len();
         let s = asm.stats().clone();
         assert_eq!(s.packets, 15_907);
         assert_eq!(s.not_shreds, 1);
