@@ -43,6 +43,9 @@ pub enum Error {
     /// Data shred whose size field points before its headers end or past its shard.
     #[error("invalid data size {size} for a shard of {shard_len} bytes")]
     InvalidDataSize { size: u16, shard_len: usize },
+    /// Merkle proof whose length is not whole 20 byte entries, or too short for the shard index.
+    #[error("invalid merkle proof for shard index {shard_index}")]
+    InvalidMerkleProof { shard_index: usize },
     /// Entry batch bytes that don't decode as entries.
     #[error("entry decode failed: {0}")]
     Decode(#[from] wincode::ReadError),
