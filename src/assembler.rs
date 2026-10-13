@@ -14,7 +14,7 @@ use crate::block::{Batcher, Component, decode_component, is_last_in_slot};
 use crate::error::Error;
 use crate::fec::{DATA_SHREDS, FecSet, TOTAL_SHREDS};
 use crate::footer::{Footer, decode_footer};
-use crate::leaders::{LeaderSchedule, signed_by};
+use crate::leaders::{LeaderSchedule, Pubkey, signed_by};
 use crate::merkle::shred_root;
 use crate::shred::{Kind, Shred};
 use crate::wire;
@@ -93,6 +93,8 @@ pub enum Event {
     /// One slot, once it is closed. Comes after every other event of the slot.
     Slot {
         slot: u64,
+        /// The slot's leader, None without a leader schedule or if the schedule doesn't cover it.
+        leader: Option<Pubkey>,
         /// First shred of any of its sets arrived.
         first_shred_ns: u64,
         /// The last batch of the slot decoded, None if nothing decoded.
@@ -100,6 +102,8 @@ pub enum Event {
         sets_decoded: u32,
         sets_lost: u32,
         txs: u64,
+        /// Data shreds whose first copy came after their set was decoded.
+        late_data: u32,
         /// The block footer, None if it never decoded.
         footer: Option<Footer>,
         end: SlotEnd,
@@ -181,6 +185,8 @@ struct SlotState {
     /// Sets that failed to rebuild, the ones still waiting are added when the slot closes.
     sets_lost: u32,
     txs: u64,
+    /// Data shreds whose first copy came after their set was decoded.
+    late_data: u32,
     footer: Option<Footer>,
     /// When the slot's latest batch decoded.
     done_ns: Option<u64>,
@@ -271,6 +277,7 @@ impl Assembler {
             sets_decoded: 0,
             sets_lost: 0,
             txs: 0,
+            late_data: 0,
             footer: None,
             done_ns: None,
             batch_start: None,
@@ -278,8 +285,11 @@ impl Assembler {
             seen: BTreeMap::new(),
             ended: None,
         });
+        let is_data = shred.variant.kind == Kind::Data;
         if state.ended.is_some() {
-            seen_late(&mut state.seen, shred.fec_set_index, bit, &mut self.stats);
+            if seen_late(&mut state.seen, shred.fec_set_index, bit, &mut self.stats) && is_data {
+                state.late_data += 1;
+            }
             return events;
         }
         state.first_seen_ns = state.first_seen_ns.min(recv_ns);
@@ -292,6 +302,7 @@ impl Assembler {
             // its set was already decoded, the shred is no longer needed
             seen.shreds |= bit;
             self.stats.after_decode += 1;
+            state.late_data += u32::from(is_data);
             return events;
         }
 
@@ -501,11 +512,13 @@ impl Assembler {
         );
         events.push(Event::Slot {
             slot,
+            leader: self.leaders.as_ref().and_then(|l| l.leader(slot)).copied(),
             first_shred_ns: state.first_seen_ns,
             done_ns: state.done_ns,
             sets_decoded: state.sets_decoded,
             sets_lost: state.sets_lost + state.sets.len() as u32,
             txs: state.txs,
+            late_data: state.late_data,
             footer: state.footer,
             end,
         });
@@ -539,13 +552,21 @@ impl Assembler {
 }
 
 /// Counts a shred that came after its slot ended, as a duplicate or as a first copy.
-fn seen_late(sets: &mut BTreeMap<u32, Seen>, fec_set_index: u32, bit: u64, stats: &mut Stats) {
+/// True for a first copy.
+fn seen_late(
+    sets: &mut BTreeMap<u32, Seen>,
+    fec_set_index: u32,
+    bit: u64,
+    stats: &mut Stats,
+) -> bool {
     let seen = sets.entry(fec_set_index).or_default();
     if seen.shreds & bit != 0 {
         stats.duplicates += 1;
+        false
     } else {
         seen.shreds |= bit;
         stats.after_slot_done += 1;
+        true
     }
 }
 
@@ -1167,11 +1188,13 @@ mod tests {
         assert_eq!(slots.len(), 1);
         let Event::Slot {
             slot,
+            leader,
             first_shred_ns,
             done_ns,
             sets_decoded,
             sets_lost,
             txs,
+            late_data,
             footer,
             end,
         } = slots[0]
@@ -1182,6 +1205,10 @@ mod tests {
         assert_eq!(*first_shred_ns, arrivals()[0].0);
         assert!(done_ns.unwrap() > *first_shred_ns);
         assert_eq!((*sets_decoded, *sets_lost, *txs), (4, 0, 26));
+        // no schedule, so no leader
+        assert_eq!(*leader, None);
+        // the slot decodes before all its data is in, the rest still arrives
+        assert!(*late_data > 0);
         assert_eq!(
             footer.as_ref().unwrap().final_cert.as_ref().unwrap().slot,
             SLOT - 1

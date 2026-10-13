@@ -59,12 +59,15 @@ struct SetRecord<'a> {
 #[derive(Serialize)]
 struct SlotRecord<'a> {
     slot: u64,
+    /// base58, null without a leader schedule.
+    leader: Option<String>,
     first_shred_ns: u64,
     /// When the last batch decoded, null if nothing did.
     done_ns: Option<u64>,
     sets_decoded: u32,
     sets_lost: u32,
     txs: u64,
+    late_data: u32,
     /// null if the slot's footer never decoded.
     footer: Option<FooterRecord<'a>>,
     end: &'static str,
@@ -211,21 +214,25 @@ impl<W: Write> Output<W> {
             }
             Event::Slot {
                 slot,
+                leader,
                 first_shred_ns,
                 done_ns,
                 sets_decoded,
                 sets_lost,
                 txs,
+                late_data,
                 footer,
                 end,
             } => {
                 let record = SlotRecord {
                     slot: *slot,
+                    leader: leader.map(base58),
                     first_shred_ns: *first_shred_ns,
                     done_ns: *done_ns,
                     sets_decoded: *sets_decoded,
                     sets_lost: *sets_lost,
                     txs: *txs,
+                    late_data: *late_data,
                     footer: footer.as_ref().map(FooterRecord::from),
                     end: match end {
                         SlotEnd::Complete => "complete",
@@ -309,7 +316,7 @@ mod tests {
                 block_id: [0; 32],
                 fast: true,
                 finalize: Signers {
-                    validators: 473,
+                    bits: 473,
                     voted: 355,
                     fallback: 0,
                 },
@@ -320,7 +327,7 @@ mod tests {
                 slot: 449_661_780,
                 block_id: Some([0; 32]),
                 signers: Signers {
-                    validators: 473,
+                    bits: 473,
                     voted: 458,
                     fallback: 0,
                 },
@@ -419,22 +426,26 @@ mod tests {
         let mut out = memory_output();
         out.write(&Event::Slot {
             slot: 449_661_788,
+            leader: Some([0; 32]),
             first_shred_ns: 100,
             done_ns: Some(300),
             sets_decoded: 4,
             sets_lost: 0,
             txs: 26,
+            late_data: 7,
             footer: Some(footer()),
             end: SlotEnd::Complete,
         })
         .unwrap();
         out.write(&Event::Slot {
             slot: 449_661_789,
+            leader: None,
             first_shred_ns: 120,
             done_ns: None,
             sets_decoded: 0,
             sets_lost: 2,
             txs: 0,
+            late_data: 0,
             footer: None,
             end: SlotEnd::GivenUp,
         })
@@ -442,8 +453,8 @@ mod tests {
         assert_eq!(
             lines(&out.slots),
             [
-                r#"{"slot":449661788,"first_shred_ns":100,"done_ns":300,"sets_decoded":4,"sets_lost":0,"txs":26,"footer":{"bank_hash":"11111111111111111111111111111111","producer_time_ns":5,"user_agent":"agave","final_cert":{"slot":449661787,"block_id":"11111111111111111111111111111111","fast":true,"finalize":{"validators":473,"voted":355,"fallback":0},"notarize":null},"skip_reward":null,"notar_reward":{"slot":449661780,"block_id":"11111111111111111111111111111111","signers":{"validators":473,"voted":458,"fallback":0}}},"end":"complete"}"#,
-                r#"{"slot":449661789,"first_shred_ns":120,"done_ns":null,"sets_decoded":0,"sets_lost":2,"txs":0,"footer":null,"end":"given_up"}"#,
+                r#"{"slot":449661788,"leader":"11111111111111111111111111111111","first_shred_ns":100,"done_ns":300,"sets_decoded":4,"sets_lost":0,"txs":26,"late_data":7,"footer":{"bank_hash":"11111111111111111111111111111111","producer_time_ns":5,"user_agent":"agave","final_cert":{"slot":449661787,"block_id":"11111111111111111111111111111111","fast":true,"finalize":{"bits":473,"voted":355,"fallback":0},"notarize":null},"skip_reward":null,"notar_reward":{"slot":449661780,"block_id":"11111111111111111111111111111111","signers":{"bits":473,"voted":458,"fallback":0}}},"end":"complete"}"#,
+                r#"{"slot":449661789,"leader":null,"first_shred_ns":120,"done_ns":null,"sets_decoded":0,"sets_lost":2,"txs":0,"late_data":0,"footer":null,"end":"given_up"}"#,
             ]
         );
         assert!(out.tx.is_empty());

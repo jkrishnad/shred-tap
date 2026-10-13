@@ -14,8 +14,8 @@
 //! A reward cert is slot u64, block id 32 (notar only), a 96 byte signature
 //! and a bitmap whose length is a ShortU16, 1 to 3 bytes of 7 bits each.
 //! A bitmap is solana-signer-store encoded, a version byte (0 base 2, 1 base 3),
-//! a u16 count of validators, then the bits. Base 3 packs two votes per validator,
-//! five validators to a byte.
+//! a u16 count of bits, then the bits, one per validator by stake rank. Base 3 packs two votes
+//! per validator, five validators to a byte. Agave cuts the bitmap after its last signer.
 
 use crate::error::{Error, Result};
 
@@ -69,11 +69,11 @@ pub struct RewardCert {
     pub signers: Signers,
 }
 
-/// How many validators a certificate's bitmap counts and how many of them signed.
+/// How long a certificate's bitmap is and how many signed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Signers {
-    /// Length of the bitmap, one place per validator by stake rank.
-    pub validators: u16,
+    /// Length of the bitmap. Agave cuts it after the last signer, so it is not the validator count.
+    pub bits: u16,
     pub voted: u16,
     /// Signed the fallback vote instead, only in base 3 bitmaps.
     pub fallback: u16,
@@ -148,26 +148,26 @@ fn read_aggregate(r: &mut Reader) -> Result<Signers> {
 }
 
 /// Counts the signers in a solana-signer-store bitmap, a version byte,
-/// a u16 count of validators, then the bits for exactly that many.
+/// a u16 count of bits, then the bits for exactly that many.
 pub fn read_signers(bitmap: &[u8]) -> Result<Signers> {
     let mut r = Reader {
         bytes: bitmap,
         at: 0,
     };
     let version = r.u8()?;
-    let validators = u16::from_le_bytes(r.array()?);
-    let count = usize::from(validators);
-    let bits = r.rest();
+    let bits = u16::from_le_bytes(r.array()?);
+    let count = usize::from(bits);
+    let body = r.rest();
 
     let (voted, fallback) = match version {
         BASE2 => {
-            if bits.len() != count.div_ceil(8) {
+            if body.len() != count.div_ceil(8) {
                 return Err(Error::InvalidFooter(
                     "base 2 bitmap size does not match its count",
                 ));
             }
             // bits past the count in the last byte are not validators
-            let voted = bits
+            let voted = body
                 .iter()
                 .enumerate()
                 .map(|(i, byte)| {
@@ -179,14 +179,14 @@ pub fn read_signers(bitmap: &[u8]) -> Result<Signers> {
             (voted, 0)
         }
         BASE3 => {
-            if bits.len() != count.div_ceil(BASE3_PER_BYTE) {
+            if body.len() != count.div_ceil(BASE3_PER_BYTE) {
                 return Err(Error::InvalidFooter(
                     "base 3 bitmap size does not match its count",
                 ));
             }
             // each byte holds 5 validators, the lowest digit first, 1 voted and 2 voted fallback
             let (mut voted, mut fallback) = (0u32, 0u32);
-            for (i, &byte) in bits.iter().enumerate() {
+            for (i, &byte) in body.iter().enumerate() {
                 let mut digits = byte;
                 for _ in 0..BASE3_PER_BYTE.min(count - i * BASE3_PER_BYTE) {
                     match digits % 3 {
@@ -205,7 +205,7 @@ pub fn read_signers(bitmap: &[u8]) -> Result<Signers> {
     // never more than the count, which is a u16
     let to_u16 = |n: u32| u16::try_from(n).map_err(|_| Error::InvalidFooter("signer count"));
     Ok(Signers {
-        validators,
+        bits,
         voted: to_u16(voted)?,
         fallback: to_u16(fallback)?,
     })
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(
             cert.finalize,
             Signers {
-                validators: 473,
+                bits: 473,
                 voted: 355,
                 fallback: 0
             }
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(skip.slot, 449_661_780);
         assert_eq!(skip.block_id, None);
         assert_eq!(skip.signers.voted, 1);
-        assert_eq!(skip.signers.validators, 398);
+        assert_eq!(skip.signers.bits, 398);
         let notar = footer.notar_reward.unwrap();
         assert_eq!(notar.slot, 449_661_780);
         assert_eq!(
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(
             signers,
             Signers {
-                validators: 5,
+                bits: 5,
                 voted: 2,
                 fallback: 1
             }
@@ -460,7 +460,7 @@ mod tests {
 
         let skip = decode_footer(&b).unwrap().skip_reward.unwrap();
         assert_eq!(skip.slot, 9);
-        assert_eq!(skip.signers.validators, 1_100);
+        assert_eq!(skip.signers.bits, 1_100);
         assert_eq!(skip.signers.voted, 1_100);
 
         // a ShortU16 padded with a zero byte is refused, as Agave does
