@@ -16,30 +16,44 @@ fn capture() -> Vec<u8> {
     f.extend_from_slice(&[0u8; 8]);
     f.extend_from_slice(&65535u32.to_le_bytes());
     f.extend_from_slice(&1u32.to_le_bytes());
+    for (recv_ns, shred) in arrivals() {
+        f.extend(record(recv_ns, shred));
+    }
+    f
+}
+
+fn arrivals() -> Vec<(u64, &'static [u8])> {
+    let mut out = Vec::new();
     let mut at = 0;
     while at < ARRIVALS.len() {
         let recv_ns = u64::from_le_bytes(ARRIVALS[at..at + 8].try_into().unwrap());
         let len = usize::from(u16::from_le_bytes([ARRIVALS[at + 8], ARRIVALS[at + 9]]));
-        let shred = &ARRIVALS[at + 10..at + 10 + len];
+        out.push((recv_ns, &ARRIVALS[at + 10..at + 10 + len]));
         at += 10 + len;
-
-        let mut frame = vec![0u8; 12];
-        frame.extend_from_slice(&[0x08, 0x00, 0x45, 0]);
-        frame.extend_from_slice(&((20 + 8 + len) as u16).to_be_bytes());
-        frame.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 192, 0, 2, 2]);
-        frame.extend_from_slice(&8000u16.to_be_bytes());
-        frame.extend_from_slice(&8001u16.to_be_bytes());
-        frame.extend_from_slice(&((8 + len) as u16).to_be_bytes());
-        frame.extend_from_slice(&[0, 0]);
-        frame.extend_from_slice(shred);
-
-        f.extend_from_slice(&((recv_ns / 1_000_000_000) as u32).to_le_bytes());
-        f.extend_from_slice(&((recv_ns % 1_000_000_000) as u32).to_le_bytes());
-        f.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-        f.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-        f.extend_from_slice(&frame);
     }
-    f
+    out
+}
+
+// One pcap record, the shred in a UDP packet to port 8001.
+fn record(recv_ns: u64, shred: &[u8]) -> Vec<u8> {
+    let len = shred.len();
+    let mut frame = vec![0u8; 12];
+    frame.extend_from_slice(&[0x08, 0x00, 0x45, 0]);
+    frame.extend_from_slice(&((20 + 8 + len) as u16).to_be_bytes());
+    frame.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 192, 0, 2, 2]);
+    frame.extend_from_slice(&8000u16.to_be_bytes());
+    frame.extend_from_slice(&8001u16.to_be_bytes());
+    frame.extend_from_slice(&((8 + len) as u16).to_be_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(shred);
+
+    let mut r = Vec::new();
+    r.extend_from_slice(&((recv_ns / 1_000_000_000) as u32).to_le_bytes());
+    r.extend_from_slice(&((recv_ns % 1_000_000_000) as u32).to_le_bytes());
+    r.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    r.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    r.extend_from_slice(&frame);
+    r
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -111,37 +125,66 @@ fn decode_stdin() {
 }
 
 #[test]
-fn missing_file_fails() {
-    let dir = temp_dir("missing");
-    let output = Command::new(env!("CARGO_BIN_EXE_shredtap"))
-        .args([
-            "decode",
-            "/nonexistent/capture.pcap",
-            "--out",
-            dir.to_str().unwrap(),
-        ])
-        .output()
+fn stream_events_before_the_input_ends() {
+    // with --out - every event is a JSON line on stdout, written the moment its slot closes
+    use std::io::{BufRead, BufReader, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shredtap"))
+        .args(["decode", "-", "--out", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(!output.stderr.is_empty());
-    std::fs::remove_dir_all(&dir).unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&capture()).unwrap();
+    // a shred of a later slot, 2 s on, moves the capture clock past the fixture slot's deadline
+    let (last_ns, shred) = *arrivals().last().unwrap();
+    let mut later = shred.to_vec();
+    later[65..73].copy_from_slice(&(449_661_788u64 + 100).to_le_bytes());
+    stdin
+        .write_all(&record(last_ns + 2_000_000_000, &later))
+        .unwrap();
+    stdin.flush().unwrap();
+
+    // stdin is still open, yet the slot's lines arrive, the slot line last
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let lines: Vec<String> = (&mut stdout)
+        .lines()
+        .map(Result::unwrap)
+        .take_while(|l| !l.starts_with(r#"{"kind":"slot""#))
+        .collect();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with(r#"{"kind":"tx""#))
+            .count(),
+        26
+    );
+
+    // the reader stays open to the end, shredtap still writes its last lines when stdin closes
+    drop(stdin);
+    std::io::copy(&mut stdout, &mut std::io::sink()).unwrap();
+    assert!(child.wait().unwrap().success());
 }
 
 #[test]
-fn not_a_pcap_fails() {
+fn bad_input_fails() {
+    // a missing file and a file that is not a pcap both stop with an error on stderr
     let dir = temp_dir("bad");
     let bad = dir.join("bad.pcap");
     std::fs::write(&bad, b"definitely not a capture file").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_shredtap"))
-        .args([
-            "decode",
-            bad.to_str().unwrap(),
-            "--out",
-            dir.join("out").to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("pcap"));
+    for input in [Path::new("/nonexistent/capture.pcap"), bad.as_path()] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shredtap"))
+            .args([
+                "decode",
+                input.to_str().unwrap(),
+                "--out",
+                dir.join("out").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!output.stderr.is_empty());
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

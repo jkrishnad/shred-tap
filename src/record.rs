@@ -1,9 +1,11 @@
-//! Writes the assembler's events as JSON lines, one file per kind, and the run's totals as a summary.
+//! Writes the assembler's events as JSON lines, and the run's totals as a summary.
 //!
 //! Every event becomes one small record, a flat struct whose fields serde writes in order.
-//! Transactions go to tx.jsonl, block markers to markers.jsonl, FEC sets to sets.jsonl
-//! and one line per slot to slots.jsonl.
-//! Output is generic over the writer, files on disk for a real run and Vec<u8> in tests.
+//! An EventSink is where those records go. Output writes one file per kind: transactions
+//! to tx.jsonl, block markers to markers.jsonl, FEC sets to sets.jsonl and slots to slots.jsonl.
+//! LineSink writes every kind to one stream, each line tagged with its kind and flushed at once,
+//! so a reader such as a terminal on stdout sees each event the moment it happens.
+//! Both are generic over the writer, files or stdout for a real run and Vec<u8> in tests.
 //! write_summary writes the Stats once at the end as pretty JSON.
 
 use std::fs::File;
@@ -129,7 +131,116 @@ fn base58(bytes: [u8; 32]) -> String {
     Hash::new_from_array(bytes).to_string()
 }
 
-/// Where events are written. W is any writer, files on disk or a Vec<u8> in tests.
+/// One event as the record its line holds. Tagged with its kind when every kind shares one stream.
+// a Record lives only while its line is written, so the big slot variant costs nothing to keep inline
+#[allow(clippy::large_enum_variant)]
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum Record<'a> {
+    Tx(TxRecord),
+    Marker(MarkerRecord),
+    Set(SetRecord<'a>),
+    Slot(SlotRecord<'a>),
+}
+
+impl<'a> From<&'a Event> for Record<'a> {
+    fn from(event: &'a Event) -> Self {
+        match event {
+            Event::Tx {
+                slot,
+                signature,
+                timing,
+                rebuilt,
+            } => {
+                let Timing {
+                    fec_set_index,
+                    first_shred_ns,
+                    decodable_ns,
+                    decoded_ns,
+                } = *timing;
+                Record::Tx(TxRecord {
+                    slot: *slot,
+                    sig: signature.to_string(),
+                    fec_set: fec_set_index,
+                    t0_ns: first_shred_ns,
+                    t1_ns: decodable_ns,
+                    t2_ns: decoded_ns,
+                    rebuilt: *rebuilt,
+                })
+            }
+            Event::Marker {
+                slot,
+                variant,
+                data,
+                timing,
+                rebuilt,
+            } => Record::Marker(MarkerRecord {
+                slot: *slot,
+                variant: *variant,
+                len: data.len(),
+                fec_set: timing.fec_set_index,
+                t0_ns: timing.first_shred_ns,
+                t1_ns: timing.decodable_ns,
+                t2_ns: timing.decoded_ns,
+                rebuilt: *rebuilt,
+            }),
+            Event::Set {
+                slot,
+                fec_set_index,
+                first_shred_ns,
+                decodable_ns,
+                data_at_decode,
+                rebuilt,
+                decoded,
+            } => Record::Set(SetRecord {
+                slot: *slot,
+                fec_set: *fec_set_index,
+                t0_ns: *first_shred_ns,
+                t1_ns: *decodable_ns,
+                data_at_decode: *data_at_decode,
+                rebuilt,
+                decoded: *decoded,
+            }),
+            Event::Slot {
+                slot,
+                leader,
+                first_shred_ns,
+                done_ns,
+                sets_decoded,
+                sets_lost,
+                txs,
+                late_data,
+                footer,
+                end,
+            } => Record::Slot(SlotRecord {
+                slot: *slot,
+                leader: leader.map(base58),
+                first_shred_ns: *first_shred_ns,
+                done_ns: *done_ns,
+                sets_decoded: *sets_decoded,
+                sets_lost: *sets_lost,
+                txs: *txs,
+                late_data: *late_data,
+                footer: footer.as_ref().map(FooterRecord::from),
+                end: match end {
+                    SlotEnd::Complete => "complete",
+                    SlotEnd::GivenUp => "given_up",
+                    SlotEnd::EndOfInput => "end_of_input",
+                },
+            }),
+        }
+    }
+}
+
+/// Where the assembler's events go.
+pub trait EventSink {
+    /// Writes one event.
+    fn write(&mut self, event: &Event) -> Result<()>;
+    /// Pushes anything still buffered out.
+    fn flush(&mut self) -> Result<()>;
+}
+
+/// One file per kind. W is any writer, files on disk or a Vec<u8> in tests.
 pub struct Output<W> {
     pub tx: W,
     pub markers: W,
@@ -146,111 +257,49 @@ impl<W: Write> Output<W> {
             slots,
         }
     }
+}
 
-    /// Writes one event as one line in the file for its kind.
-    pub fn write(&mut self, event: &Event) -> Result<()> {
-        match event {
-            Event::Tx {
-                slot,
-                signature,
-                timing,
-                rebuilt,
-            } => {
-                let Timing {
-                    fec_set_index,
-                    first_shred_ns,
-                    decodable_ns,
-                    decoded_ns,
-                } = *timing;
-                let record = TxRecord {
-                    slot: *slot,
-                    sig: signature.to_string(),
-                    fec_set: fec_set_index,
-                    t0_ns: first_shred_ns,
-                    t1_ns: decodable_ns,
-                    t2_ns: decoded_ns,
-                    rebuilt: *rebuilt,
-                };
-                write_line(&mut self.tx, &record)
-            }
-            Event::Marker {
-                slot,
-                variant,
-                data,
-                timing,
-                rebuilt,
-            } => {
-                let record = MarkerRecord {
-                    slot: *slot,
-                    variant: *variant,
-                    len: data.len(),
-                    fec_set: timing.fec_set_index,
-                    t0_ns: timing.first_shred_ns,
-                    t1_ns: timing.decodable_ns,
-                    t2_ns: timing.decoded_ns,
-                    rebuilt: *rebuilt,
-                };
-                write_line(&mut self.markers, &record)
-            }
-            Event::Set {
-                slot,
-                fec_set_index,
-                first_shred_ns,
-                decodable_ns,
-                data_at_decode,
-                rebuilt,
-                decoded,
-            } => {
-                let record = SetRecord {
-                    slot: *slot,
-                    fec_set: *fec_set_index,
-                    t0_ns: *first_shred_ns,
-                    t1_ns: *decodable_ns,
-                    data_at_decode: *data_at_decode,
-                    rebuilt,
-                    decoded: *decoded,
-                };
-                write_line(&mut self.sets, &record)
-            }
-            Event::Slot {
-                slot,
-                leader,
-                first_shred_ns,
-                done_ns,
-                sets_decoded,
-                sets_lost,
-                txs,
-                late_data,
-                footer,
-                end,
-            } => {
-                let record = SlotRecord {
-                    slot: *slot,
-                    leader: leader.map(base58),
-                    first_shred_ns: *first_shred_ns,
-                    done_ns: *done_ns,
-                    sets_decoded: *sets_decoded,
-                    sets_lost: *sets_lost,
-                    txs: *txs,
-                    late_data: *late_data,
-                    footer: footer.as_ref().map(FooterRecord::from),
-                    end: match end {
-                        SlotEnd::Complete => "complete",
-                        SlotEnd::GivenUp => "given_up",
-                        SlotEnd::EndOfInput => "end_of_input",
-                    },
-                };
-                write_line(&mut self.slots, &record)
-            }
+impl<W: Write> EventSink for Output<W> {
+    /// Writes one event as one line in the file for its kind, without the kind tag.
+    fn write(&mut self, event: &Event) -> Result<()> {
+        match Record::from(event) {
+            Record::Tx(r) => write_line(&mut self.tx, &r),
+            Record::Marker(r) => write_line(&mut self.markers, &r),
+            Record::Set(r) => write_line(&mut self.sets, &r),
+            Record::Slot(r) => write_line(&mut self.slots, &r),
         }
     }
 
-    /// Pushes buffered lines out to the writers.
-    pub fn flush(&mut self) -> Result<()> {
+    fn flush(&mut self) -> Result<()> {
         self.tx.flush()?;
         self.markers.flush()?;
         self.sets.flush()?;
         self.slots.flush()?;
+        Ok(())
+    }
+}
+
+/// Every kind on one stream, each line tagged with its kind and flushed as soon as it is written.
+pub struct LineSink<W> {
+    out: W,
+}
+
+impl<W: Write> LineSink<W> {
+    pub fn new(out: W) -> Self {
+        Self { out }
+    }
+}
+
+impl<W: Write> EventSink for LineSink<W> {
+    fn write(&mut self, event: &Event) -> Result<()> {
+        write_line(&mut self.out, &Record::from(event))?;
+        // a live reader must not wait for a buffer to fill
+        self.out.flush()?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.out.flush()?;
         Ok(())
     }
 }
@@ -474,6 +523,62 @@ mod tests {
         }
         assert_eq!(lines(&out.tx).len(), 3);
         assert!(out.tx.ends_with(b"\n"));
+    }
+
+    // a writer that remembers how many times it was flushed
+    #[derive(Default)]
+    struct Counted {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for Counted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_line_sink_tags_and_flushes_every_event() {
+        let mut sink = LineSink::new(Counted::default());
+        sink.write(&Event::Tx {
+            slot: 1,
+            signature: Signature::from_str(SIG).unwrap(),
+            timing: timing(),
+            rebuilt: false,
+        })
+        .unwrap();
+        // flushed already, a reader on the other end sees it now
+        assert_eq!(sink.out.flushes, 1);
+        sink.write(&Event::Set {
+            slot: 1,
+            fec_set_index: 0,
+            first_shred_ns: 100,
+            decodable_ns: None,
+            data_at_decode: 16,
+            rebuilt: Vec::new(),
+            decoded: false,
+        })
+        .unwrap();
+        assert_eq!(sink.out.flushes, 2);
+
+        // every kind on one stream, told apart by the kind tag, the rest as in the files
+        let text = lines(&sink.out.bytes);
+        assert_eq!(text.len(), 2);
+        assert!(
+            text[0].starts_with(r#"{"kind":"tx","slot":1,"sig":""#),
+            "{}",
+            text[0]
+        );
+        assert!(
+            text[1].starts_with(r#"{"kind":"set","slot":1,"fec_set":0,"#),
+            "{}",
+            text[1]
+        );
     }
 
     #[test]
