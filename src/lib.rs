@@ -8,6 +8,7 @@
 //!    merkle climbs a shred's Merkle proof to its set's root, to check the shred belongs there.
 //!    leaders reads the leader schedule and checks the leader's signature on that root.
 //! 5. block joins data shards into batches and decodes them into entries or block markers.
+//!    footer reads the block footer marker, its bank hash, clock, client and certificates.
 //! 6. assembler runs all of the above on a live or recorded stream, in the right order, with timing.
 //! 7. record writes the assembler's events as JSON lines and the run's totals as a summary.
 //!
@@ -16,6 +17,7 @@ pub mod assembler;
 pub mod block;
 pub mod error;
 pub mod fec;
+pub mod footer;
 pub mod leaders;
 pub mod merkle;
 pub mod pcap;

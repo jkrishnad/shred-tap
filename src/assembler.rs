@@ -1265,13 +1265,30 @@ mod tests {
         };
         let mut reader = PcapReader::new(std::io::BufReader::new(file)).unwrap();
         let mut asm = Assembler::new().with_leaders(leaders());
-        let mut txs = 0;
+        let mut events = Vec::new();
         while let Some(rec) = reader.next_record().unwrap() {
             if let Some(payload) = udp_payload(&rec.frame) {
-                txs += signatures(&asm.push(payload, rec.recv_ns)).len();
+                events.extend(asm.push(payload, rec.recv_ns));
             }
         }
-        txs += signatures(&asm.finish()).len();
+        events.extend(asm.finish());
+        let txs = signatures(&events).len();
+        // every footer that decoded reads as one, and finalizes the slot before
+        let mut footers = 0;
+        for e in &events {
+            if let Event::Marker {
+                slot,
+                variant: 0,
+                data,
+                ..
+            } = e
+            {
+                let footer = crate::footer::decode_footer(data).unwrap();
+                assert_eq!(footer.final_cert.unwrap().slot, slot - 1);
+                footers += 1;
+            }
+        }
+        assert_eq!(footers, 45);
         let s = asm.stats().clone();
         assert_eq!(s.packets, 15_907);
         assert_eq!(s.not_shreds, 1);

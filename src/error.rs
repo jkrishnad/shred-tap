@@ -58,6 +58,9 @@ pub enum Error {
     /// Entry batch bytes that don't decode as entries.
     #[error("entry decode failed: {0}")]
     Decode(#[from] wincode::ReadError),
+    /// Block footer bytes that break Agave's footer layout.
+    #[error("invalid block footer: {0}")]
+    InvalidFooter(&'static str),
     /// File doesn't start with a pcap magic number, for example a pcapng file.
     #[error("not a pcap file, magic {0:#010x}")]
     BadPcapMagic(u32),
