@@ -73,10 +73,20 @@ pub enum Error {
     /// Record longer than the capture's snaplen, so its length field is corrupt.
     #[error("pcap record of {len} bytes is longer than the snaplen {snaplen}")]
     PcapRecordTooLarge { len: usize, snaplen: usize },
+    /// The live capture on a network interface failed, for example no permission to open it.
+    #[error("live capture: {0}")]
+    Capture(String),
     /// Reading the capture failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// Writing a record as JSON failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+#[cfg(feature = "live")]
+impl From<pcap::Error> for Error {
+    fn from(e: pcap::Error) -> Self {
+        Error::Capture(e.to_string())
+    }
 }

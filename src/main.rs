@@ -1,10 +1,11 @@
 //! The shredtap command line, a thin layer over the library.
 //!
-//! decode reads a pcap capture, from a file or from stdin when the input is "-",
-//! runs every packet through the assembler and writes the events and a summary into a folder,
-//! or with --out - streams every event to stdout as one JSON line, the moment it happens.
-//! The totals are printed on stderr, so they never mix with the events on stdout.
-//! With --leader-schedule it also checks every FEC set's signature against its slot's leader.
+//! decode reads a pcap capture, from a file or from stdin when the input is "-".
+//! live, built with the live feature, reads shreds straight from a network interface.
+//! Both run every packet through the assembler the same way, in run, and write the events
+//! and a summary into a folder, or with --out - stream every event to stdout as one JSON line,
+//! the moment it happens. The totals are printed on stderr, so they never mix with the events.
+//! With --leader-schedule every FEC set's signature is checked against its slot's leader.
 //! All the work happens in the library, this file only parses arguments and reports errors.
 
 use std::fs::File;
@@ -12,10 +13,10 @@ use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use shredtap::assembler::{Assembler, DEFAULT_SLOT_NS, Stats};
 use shredtap::leaders::LeaderSchedule;
-use shredtap::pcap::{PcapReader, udp_payload};
+use shredtap::pcap::{PacketSource, PcapReader, udp_payload};
 use shredtap::record::{EventSink, LineSink, Output, write_summary};
 
 #[derive(Parser)]
@@ -34,40 +35,60 @@ enum Command {
     Decode {
         /// Capture file, or - to read a pcap stream from stdin (for example a tcpdump pipe)
         input: PathBuf,
-        /// Folder for the output files, created if missing, or - to stream every event to stdout
-        #[arg(long)]
-        out: PathBuf,
-        /// Slot duration in milliseconds, it sets when an unfinished slot is given up on
-        #[arg(long, default_value_t = DEFAULT_SLOT_NS / 1_000_000)]
-        slot_ms: u64,
-        /// Output of solana leader-schedule, repeat it for a capture that spans epochs
-        #[arg(long)]
-        leader_schedule: Vec<PathBuf>,
+        #[command(flatten)]
+        options: Options,
     },
+    /// Capture shreds live from a network interface and decode them as they arrive
+    #[cfg(feature = "live")]
+    Live {
+        /// Network interface the shreds arrive on, like ens3f0np0
+        #[arg(long)]
+        interface: String,
+        #[command(flatten)]
+        options: Options,
+    },
+}
+
+/// What decode and live share.
+#[derive(Args)]
+struct Options {
+    /// Folder for the output files, created if missing, or - to stream every event to stdout
+    #[arg(long)]
+    out: PathBuf,
+    /// Slot duration in milliseconds, it sets when an unfinished slot is given up on
+    #[arg(long, default_value_t = DEFAULT_SLOT_NS / 1_000_000)]
+    slot_ms: u64,
+    /// Output of solana leader-schedule, repeat it for a capture that spans epochs
+    #[arg(long)]
+    leader_schedule: Vec<PathBuf>,
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Decode {
-            input,
-            out,
-            slot_ms,
-            leader_schedule,
-        } => decode(&input, &out, slot_ms, &leader_schedule),
+        Command::Decode { input, options } => {
+            let source: Box<dyn Read> = if input == Path::new("-") {
+                Box::new(io::stdin().lock())
+            } else {
+                let file = File::open(&input)
+                    .with_context(|| format!("opening capture {}", input.display()))?;
+                Box::new(file)
+            };
+            let mut pcap = PcapReader::new(BufReader::new(source))
+                .with_context(|| format!("reading pcap header of {}", input.display()))?;
+            run(&mut pcap, &options)
+        }
+        #[cfg(feature = "live")]
+        Command::Live { interface, options } => {
+            let mut capture = shredtap::capture::LiveCapture::open(&interface)
+                .with_context(|| format!("opening interface {interface}"))?;
+            run(&mut capture, &options)
+        }
     }
 }
 
-fn decode(input: &Path, out: &Path, slot_ms: u64, schedules: &[PathBuf]) -> Result<()> {
-    let source: Box<dyn Read> = if input == Path::new("-") {
-        Box::new(io::stdin().lock())
-    } else {
-        let file =
-            File::open(input).with_context(|| format!("opening capture {}", input.display()))?;
-        Box::new(file)
-    };
-    let mut pcap = PcapReader::new(BufReader::new(source))
-        .with_context(|| format!("reading pcap header of {}", input.display()))?;
-
+/// Feeds every packet of a source through the assembler into the sink, until the source ends.
+fn run(source: &mut dyn PacketSource, options: &Options) -> Result<()> {
+    let out = options.out.as_path();
     let to_stdout = out == Path::new("-");
     let mut output: Box<dyn EventSink> = if to_stdout {
         Box::new(LineSink::new(io::stdout().lock()))
@@ -76,10 +97,10 @@ fn decode(input: &Path, out: &Path, slot_ms: u64, schedules: &[PathBuf]) -> Resu
             Output::create(out).with_context(|| format!("creating output in {}", out.display()))?,
         )
     };
-    let mut assembler = Assembler::with_slot_duration_ns(slot_ms * 1_000_000);
-    if !schedules.is_empty() {
+    let mut assembler = Assembler::with_slot_duration_ns(options.slot_ms * 1_000_000);
+    if !options.leader_schedule.is_empty() {
         let mut leaders = LeaderSchedule::default();
-        for path in schedules {
+        for path in &options.leader_schedule {
             let file = File::open(path)
                 .with_context(|| format!("opening leader schedule {}", path.display()))?;
             leaders
@@ -89,7 +110,7 @@ fn decode(input: &Path, out: &Path, slot_ms: u64, schedules: &[PathBuf]) -> Resu
         assembler = assembler.with_leaders(leaders);
     }
 
-    while let Some(record) = pcap.next_record().context("reading capture")? {
+    while let Some(record) = source.next_record().context("reading packets")? {
         if let Some(payload) = udp_payload(&record.frame) {
             for event in assembler.push(payload, record.recv_ns) {
                 output.write(&event).context("writing event")?;

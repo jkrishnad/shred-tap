@@ -2,6 +2,7 @@
 //!
 //! The flow, one module per step.
 //! 1. pcap pulls each shred out of a tcpdump capture, with the time it arrived.
+//!    capture does the same live from a network interface, behind the live feature.
 //! 2. wire reads single header fields straight from the shred bytes.
 //! 3. shred checks a packet once and works out its kind, its place in the FEC set and its byte layout.
 //! 4. fec collects the shreds of one FEC set and rebuilds missing data shards with Reed-Solomon.
@@ -15,6 +16,8 @@
 //! error holds the one Error type every module returns.
 pub mod assembler;
 pub mod block;
+#[cfg(feature = "live")]
+pub mod capture;
 pub mod error;
 pub mod fec;
 pub mod footer;

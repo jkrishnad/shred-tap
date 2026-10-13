@@ -1297,7 +1297,7 @@ mod tests {
 
     #[test]
     fn test_real_capture() {
-        use crate::pcap::{PcapReader, udp_payload};
+        use crate::pcap::{PacketSource, PcapReader, udp_payload};
         let Ok(file) = std::fs::File::open("tests/fixtures/real-10s.pcap") else {
             return;
         };

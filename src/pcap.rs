@@ -30,6 +30,12 @@ pub struct Record {
     pub frame: Vec<u8>,
 }
 
+/// Anything that hands out captured frames one at a time, a capture file or a live interface.
+pub trait PacketSource {
+    /// The next frame, None once the input has ended.
+    fn next_record(&mut self) -> Result<Option<Record>>;
+}
+
 /// Reads records one at a time, so a file and a live pipe from tcpdump work the same way.
 pub struct PcapReader<R> {
     reader: R,
@@ -70,9 +76,11 @@ impl<R: Read> PcapReader<R> {
             snaplen,
         })
     }
+}
 
+impl<R: Read> PacketSource for PcapReader<R> {
     /// Next record, or None at a clean end of the file.
-    pub fn next_record(&mut self) -> Result<Option<Record>> {
+    fn next_record(&mut self) -> Result<Option<Record>> {
         let mut header = [0u8; RECORD_HEADER_SIZE];
         match read_full(&mut self.reader, &mut header)? {
             0 => return Ok(None),
