@@ -13,6 +13,7 @@
 use crate::block::{Batcher, Component, decode_component, is_last_in_slot};
 use crate::error::Error;
 use crate::fec::{DATA_SHREDS, FecSet, TOTAL_SHREDS};
+use crate::footer::{Footer, decode_footer};
 use crate::leaders::{LeaderSchedule, signed_by};
 use crate::merkle::shred_root;
 use crate::shred::{Kind, Shred};
@@ -99,8 +100,8 @@ pub enum Event {
         sets_decoded: u32,
         sets_lost: u32,
         txs: u64,
-        /// The block footer was decoded.
-        footer: bool,
+        /// The block footer, None if it never decoded.
+        footer: Option<Footer>,
         end: SlotEnd,
     },
 }
@@ -156,6 +157,8 @@ pub struct Stats {
     pub txs_rebuilt: u64,
     /// Block markers handed out.
     pub markers: u64,
+    /// Footer markers whose bytes don't follow Agave's footer layout.
+    pub bad_footers: u64,
 }
 
 /// Which shreds of one FEC set have arrived, kept after the set is decoded and its slot closed.
@@ -178,7 +181,7 @@ struct SlotState {
     /// Sets that failed to rebuild, the ones still waiting are added when the slot closes.
     sets_lost: u32,
     txs: u64,
-    footer: bool,
+    footer: Option<Footer>,
     /// When the slot's latest batch decoded.
     done_ns: Option<u64>,
     /// Index of the first data shred of the batch being filled.
@@ -268,7 +271,7 @@ impl Assembler {
             sets_decoded: 0,
             sets_lost: 0,
             txs: 0,
-            footer: false,
+            footer: None,
             done_ns: None,
             batch_start: None,
             pending: Vec::new(),
@@ -402,9 +405,14 @@ impl Assembler {
                         let mut decoded = Vec::new();
                         push_events(&mut decoded, &mut self.stats, slot, component, timing);
                         for event in decoded {
-                            match event {
+                            match &event {
                                 Event::Tx { .. } => state.txs += 1,
-                                Event::Marker { variant: 0, .. } => state.footer = true,
+                                Event::Marker {
+                                    variant: 0, data, ..
+                                } => match decode_footer(data) {
+                                    Ok(footer) => state.footer = Some(footer),
+                                    Err(_) => self.stats.bad_footers += 1,
+                                },
                                 _ => {}
                             }
                             state.pending.push((event, start..i + 1));
@@ -1174,7 +1182,10 @@ mod tests {
         assert_eq!(*first_shred_ns, arrivals()[0].0);
         assert!(done_ns.unwrap() > *first_shred_ns);
         assert_eq!((*sets_decoded, *sets_lost, *txs), (4, 0, 26));
-        assert!(*footer);
+        assert_eq!(
+            footer.as_ref().unwrap().final_cert.as_ref().unwrap().slot,
+            SLOT - 1
+        );
         assert_eq!(*end, SlotEnd::Complete);
         // it closes the slot, so it is the last event
         assert!(matches!(events.last(), Some(Event::Slot { .. })));
@@ -1301,5 +1312,6 @@ mod tests {
         assert_eq!(s.no_leader, 0);
         assert_eq!(txs, 2_394);
         assert_eq!(s.txs, 2_394);
+        assert_eq!(s.bad_footers, 0);
     }
 }

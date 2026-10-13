@@ -14,6 +14,8 @@ use serde::Serialize;
 
 use crate::assembler::{Event, SlotEnd, Stats, Timing};
 use crate::error::Result;
+use crate::footer::{FinalCert, Footer, RewardCert, Signers};
+use solana_hash::Hash;
 
 /// One line of tx.jsonl, keyed by the transaction's first signature.
 #[derive(Serialize)]
@@ -55,7 +57,7 @@ struct SetRecord<'a> {
 
 /// One line of slots.jsonl, written when the slot closes.
 #[derive(Serialize)]
-struct SlotRecord {
+struct SlotRecord<'a> {
     slot: u64,
     first_shred_ns: u64,
     /// When the last batch decoded, null if nothing did.
@@ -63,8 +65,65 @@ struct SlotRecord {
     sets_decoded: u32,
     sets_lost: u32,
     txs: u64,
-    footer: bool,
+    /// null if the slot's footer never decoded.
+    footer: Option<FooterRecord<'a>>,
     end: &'static str,
+}
+
+/// The block footer inside a slot line, hashes in base58 as Solana shows them.
+#[derive(Serialize)]
+struct FooterRecord<'a> {
+    bank_hash: String,
+    producer_time_ns: u64,
+    user_agent: &'a str,
+    final_cert: Option<FinalCertRecord>,
+    skip_reward: Option<RewardRecord>,
+    notar_reward: Option<RewardRecord>,
+}
+
+#[derive(Serialize)]
+struct FinalCertRecord {
+    slot: u64,
+    block_id: String,
+    fast: bool,
+    finalize: Signers,
+    notarize: Option<Signers>,
+}
+
+/// block_id is null on the skip reward cert.
+#[derive(Serialize)]
+struct RewardRecord {
+    slot: u64,
+    block_id: Option<String>,
+    signers: Signers,
+}
+
+impl<'a> From<&'a Footer> for FooterRecord<'a> {
+    fn from(f: &'a Footer) -> Self {
+        let reward = |r: &RewardCert| RewardRecord {
+            slot: r.slot,
+            block_id: r.block_id.map(base58),
+            signers: r.signers,
+        };
+        Self {
+            bank_hash: base58(f.bank_hash),
+            producer_time_ns: f.producer_time_ns,
+            user_agent: &f.user_agent,
+            final_cert: f.final_cert.as_ref().map(|c: &FinalCert| FinalCertRecord {
+                slot: c.slot,
+                block_id: base58(c.block_id),
+                fast: c.fast,
+                finalize: c.finalize,
+                notarize: c.notarize,
+            }),
+            skip_reward: f.skip_reward.as_ref().map(reward),
+            notar_reward: f.notar_reward.as_ref().map(reward),
+        }
+    }
+}
+
+fn base58(bytes: [u8; 32]) -> String {
+    Hash::new_from_array(bytes).to_string()
 }
 
 /// Where events are written. W is any writer, files on disk or a Vec<u8> in tests.
@@ -167,7 +226,7 @@ impl<W: Write> Output<W> {
                     sets_decoded: *sets_decoded,
                     sets_lost: *sets_lost,
                     txs: *txs,
-                    footer: *footer,
+                    footer: footer.as_ref().map(FooterRecord::from),
                     end: match end {
                         SlotEnd::Complete => "complete",
                         SlotEnd::GivenUp => "given_up",
@@ -236,6 +295,36 @@ mod tests {
             first_shred_ns: 100,
             decodable_ns: 150,
             decoded_ns: 160,
+        }
+    }
+
+    // hashes of all zeros are 32 ones in base58
+    fn footer() -> Footer {
+        Footer {
+            bank_hash: [0; 32],
+            producer_time_ns: 5,
+            user_agent: "agave".into(),
+            final_cert: Some(FinalCert {
+                slot: 449_661_787,
+                block_id: [0; 32],
+                fast: true,
+                finalize: Signers {
+                    validators: 473,
+                    voted: 355,
+                    fallback: 0,
+                },
+                notarize: None,
+            }),
+            skip_reward: None,
+            notar_reward: Some(RewardCert {
+                slot: 449_661_780,
+                block_id: Some([0; 32]),
+                signers: Signers {
+                    validators: 473,
+                    voted: 458,
+                    fallback: 0,
+                },
+            }),
         }
     }
 
@@ -335,7 +424,7 @@ mod tests {
             sets_decoded: 4,
             sets_lost: 0,
             txs: 26,
-            footer: true,
+            footer: Some(footer()),
             end: SlotEnd::Complete,
         })
         .unwrap();
@@ -346,15 +435,15 @@ mod tests {
             sets_decoded: 0,
             sets_lost: 2,
             txs: 0,
-            footer: false,
+            footer: None,
             end: SlotEnd::GivenUp,
         })
         .unwrap();
         assert_eq!(
             lines(&out.slots),
             [
-                r#"{"slot":449661788,"first_shred_ns":100,"done_ns":300,"sets_decoded":4,"sets_lost":0,"txs":26,"footer":true,"end":"complete"}"#,
-                r#"{"slot":449661789,"first_shred_ns":120,"done_ns":null,"sets_decoded":0,"sets_lost":2,"txs":0,"footer":false,"end":"given_up"}"#,
+                r#"{"slot":449661788,"first_shred_ns":100,"done_ns":300,"sets_decoded":4,"sets_lost":0,"txs":26,"footer":{"bank_hash":"11111111111111111111111111111111","producer_time_ns":5,"user_agent":"agave","final_cert":{"slot":449661787,"block_id":"11111111111111111111111111111111","fast":true,"finalize":{"validators":473,"voted":355,"fallback":0},"notarize":null},"skip_reward":null,"notar_reward":{"slot":449661780,"block_id":"11111111111111111111111111111111","signers":{"validators":473,"voted":458,"fallback":0}}},"end":"complete"}"#,
+                r#"{"slot":449661789,"first_shred_ns":120,"done_ns":null,"sets_decoded":0,"sets_lost":2,"txs":0,"footer":null,"end":"given_up"}"#,
             ]
         );
         assert!(out.tx.is_empty());

@@ -70,7 +70,7 @@ pub struct RewardCert {
 }
 
 /// How many validators a certificate's bitmap counts and how many of them signed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Signers {
     /// Length of the bitmap, one place per validator by stake rank.
     pub validators: u16,
