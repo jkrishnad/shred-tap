@@ -28,8 +28,10 @@ use crate::error::{Error, Result};
 use crate::feed::Public;
 use crate::record::{EventSink, Published, untagged_json};
 
-/// Messages the queue holds before it drops.
-const QUEUE: usize = 4096;
+/// Messages the queue holds before it drops. A slot's transactions all arrive at once when it
+/// closes, and a busy slot can hold tens of thousands, so the queue has room for the biggest.
+/// About 400 bytes a transaction, so a full queue is about 26 MB.
+const QUEUE: usize = 65_536;
 /// Above this many queued, transactions are dropped, so the rest still have room.
 const TX_ROOM: usize = QUEUE * 3 / 4;
 /// Messages sent before waiting for their acks.
