@@ -6,6 +6,7 @@
 //! and a summary into a folder, or with --out - stream every event to stdout as one JSON line,
 //! the moment it happens, with the compact public feed: a summary per slot and a rollup
 //! of the last minute every 5 s. The totals are printed on stderr, so they never mix with the events.
+//! Built with the nats feature, --nats publishes them to a NATS server instead.
 //! With --leader-schedule every FEC set's signature is checked against its slot's leader.
 //! All the work happens in the library, this file only parses arguments and reports errors.
 
@@ -57,7 +58,11 @@ enum Command {
 struct Options {
     /// Folder for the output files, created if missing, or - to stream every event to stdout
     #[arg(long)]
-    out: PathBuf,
+    out: Option<PathBuf>,
+    /// NATS server to publish every event to, like 127.0.0.1:4222
+    #[cfg(feature = "nats")]
+    #[arg(long, conflicts_with = "out")]
+    nats: Option<String>,
     /// Slot duration in milliseconds, it sets when an unfinished slot is given up on
     #[arg(long, default_value_t = DEFAULT_SLOT_NS / 1_000_000)]
     slot_ms: u64,
@@ -91,15 +96,9 @@ fn main() -> Result<()> {
 
 /// Feeds every packet of a source through the assembler into the sink, until the source ends.
 fn run(source: &mut dyn PacketSource, options: &Options) -> Result<()> {
-    let out = options.out.as_path();
-    let to_stdout = out == Path::new("-");
-    let mut output: Box<dyn EventSink> = if to_stdout {
-        Box::new(LineSink::new(io::stdout().lock()))
-    } else {
-        Box::new(
-            Output::create(out).with_context(|| format!("creating output in {}", out.display()))?,
-        )
-    };
+    // the folder the files and summary.json go in, None for stdout or NATS
+    let folder = options.out.as_deref().filter(|out| *out != Path::new("-"));
+    let mut output = sink(options, folder)?;
     let mut assembler = Assembler::with_slot_duration_ns(options.slot_ms * 1_000_000);
     if !options.leader_schedule.is_empty() {
         let mut leaders = LeaderSchedule::default();
@@ -127,7 +126,12 @@ fn run(source: &mut dyn PacketSource, options: &Options) -> Result<()> {
                 output.write(&event).context("writing event")?;
             }
         }
-        if let Some(rollup) = rollups.tick(record.recv_ns, assembler.stats(), || source.drops()) {
+        if let Some(rollup) = rollups.tick(
+            record.recv_ns,
+            assembler.stats(),
+            || source.drops(),
+            || output.published(),
+        ) {
             output
                 .public(&Public::Stats(rollup))
                 .context("writing rollup")?;
@@ -143,18 +147,37 @@ fn run(source: &mut dyn PacketSource, options: &Options) -> Result<()> {
     }
     output.flush().context("flushing output")?;
 
-    if !to_stdout {
+    if let Some(out) = folder {
         let summary_path = out.join("summary.json");
         let summary = File::create(&summary_path)
             .with_context(|| format!("creating {}", summary_path.display()))?;
         write_summary(summary, assembler.stats()).context("writing summary")?;
     }
 
-    print_summary(assembler.stats(), out);
+    print_summary(assembler.stats(), folder);
     Ok(())
 }
 
-fn print_summary(stats: &Stats, out: &Path) {
+/// The sink the options ask for: NATS, a folder of files, or stdout.
+fn sink(options: &Options, folder: Option<&Path>) -> Result<Box<dyn EventSink>> {
+    #[cfg(feature = "nats")]
+    if let Some(addr) = &options.nats {
+        let sink = shredtap::nats::NatsSink::connect(addr)
+            .with_context(|| format!("connecting to NATS at {addr}"))?;
+        return Ok(Box::new(sink));
+    }
+    match (folder, &options.out) {
+        (Some(out), _) => {
+            Ok(Box::new(Output::create(out).with_context(|| {
+                format!("creating output in {}", out.display())
+            })?))
+        }
+        (None, Some(_)) => Ok(Box::new(LineSink::new(io::stdout().lock()))),
+        (None, None) => anyhow::bail!("pass --out, a folder or - for stdout"),
+    }
+}
+
+fn print_summary(stats: &Stats, folder: Option<&Path>) {
     eprintln!(
         "{} packets, {} slots complete, {} transactions, {} from rebuilt shreds",
         stats.packets, stats.slots_complete, stats.txs, stats.txs_rebuilt
@@ -170,7 +193,7 @@ fn print_summary(stats: &Stats, out: &Path) {
         "{} bad proofs, {} bad signatures, {} with no known leader",
         stats.bad_proof, stats.bad_signature, stats.no_leader
     );
-    if out != Path::new("-") {
+    if let Some(out) = folder {
         eprintln!("output in {}", out.display());
     }
 }

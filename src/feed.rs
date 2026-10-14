@@ -233,7 +233,7 @@ mod tests {
                     }
                 }
             }
-            if let Some(r) = rollups.tick(rec.recv_ns, asm.stats(), || None) {
+            if let Some(r) = rollups.tick(rec.recv_ns, asm.stats(), || None, || None) {
                 bytes += size(Public::Stats(r));
             }
         }

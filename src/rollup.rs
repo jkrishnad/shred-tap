@@ -14,6 +14,7 @@ use serde::Serialize;
 use crate::assembler::{Event, SlotEnd, Stats};
 use crate::fec::DATA_SHREDS;
 use crate::pcap::Drops;
+use crate::record::Published;
 
 /// How far back a rollup looks.
 pub const WINDOW_NS: u64 = 60_000_000_000;
@@ -42,6 +43,10 @@ pub struct Rollup {
     /// Since the start, shreds dropped by the Merkle and leader checks.
     pub bad_proof: u64,
     pub bad_signature: u64,
+    /// Messages the publisher dropped or lost since the start, null when nothing publishes.
+    pub events_dropped: Option<u64>,
+    /// Longest wait from queue to the server over the last 5 s, null when nothing went out.
+    pub publish_lag_ms: Option<f64>,
 }
 
 /// Nearest rank percentiles, in milliseconds.
@@ -119,12 +124,13 @@ impl Rollups {
     }
 
     /// Runs after every packet. Returns a Rollup once every EVERY_NS of capture time.
-    /// drops is only called then, so the capture's counters are not read for every packet.
+    /// drops and published are only called then, so the counters are not read for every packet.
     pub fn tick(
         &mut self,
         now_ns: u64,
         stats: &Stats,
         drops: impl FnOnce() -> Option<Drops>,
+        published: impl FnOnce() -> Option<Published>,
     ) -> Option<Rollup> {
         let Some(mut next) = self.next_at_ns else {
             // the first packet starts the clock
@@ -163,6 +169,7 @@ impl Rollups {
         let mut fills: Vec<u64> = self.fills.iter().map(|(_, fill)| *fill).collect();
         fills.sort_unstable();
 
+        let published = published();
         Some(Rollup {
             at_ns: now_ns,
             window_s: WINDOW_NS / 1_000_000_000,
@@ -178,6 +185,8 @@ impl Rollups {
             txs_rebuilt_pct: percent(txs_rebuilt, txs),
             bad_proof: stats.bad_proof,
             bad_signature: stats.bad_signature,
+            events_dropped: published.map(|p| p.dropped),
+            publish_lag_ms: published.and_then(|p| p.lag_ns).map(ms),
         })
     }
 
@@ -275,22 +284,22 @@ mod tests {
     #[test]
     fn test_every_five_seconds_on_the_capture_clock() {
         let mut r = Rollups::default();
-        assert!(r.tick(100 * S, &packets(0), || None).is_none()); // starts the clock
-        assert!(r.tick(104 * S, &packets(0), || None).is_none());
-        let first = r.tick(105 * S, &packets(6_750), || None).unwrap();
+        assert!(r.tick(100 * S, &packets(0), || None, || None).is_none()); // starts the clock
+        assert!(r.tick(104 * S, &packets(0), || None, || None).is_none());
+        let first = r.tick(105 * S, &packets(6_750), || None, || None).unwrap();
         assert_eq!(first.at_ns, 105 * S);
         assert_eq!(first.packets_per_s, 1_350);
-        assert!(r.tick(109 * S, &packets(0), || None).is_none());
+        assert!(r.tick(109 * S, &packets(0), || None, || None).is_none());
         // a gap of 20 s gives one rollup, and the next one is a whole step later
-        assert!(r.tick(130 * S, &packets(0), || None).is_some());
-        assert!(r.tick(134 * S, &packets(0), || None).is_none());
-        assert!(r.tick(135 * S, &packets(0), || None).is_some());
+        assert!(r.tick(130 * S, &packets(0), || None, || None).is_some());
+        assert!(r.tick(134 * S, &packets(0), || None, || None).is_none());
+        assert!(r.tick(135 * S, &packets(0), || None, || None).is_some());
     }
 
     #[test]
     fn test_numbers_over_the_window() {
         let mut r = Rollups::default();
-        r.tick(100 * S, &packets(0), || None);
+        r.tick(100 * S, &packets(0), || None, || None);
         // slot 10 lost 2 of 32 data shreds and 1 of its 2 txs holds rebuilt bytes.
         // slot 11 never came. slot 12 lost nothing
         for e in [
@@ -312,7 +321,13 @@ mod tests {
             kernel: 3,
             interface: 1,
         };
-        let roll = r.tick(105 * S, &stats, || Some(drops)).unwrap();
+        let published = Published {
+            dropped: 4,
+            lag_ns: Some(3_214_000),
+        };
+        let roll = r
+            .tick(105 * S, &stats, || Some(drops), || Some(published))
+            .unwrap();
         assert_eq!((roll.slots_closed, roll.slots_never_came), (2, 1));
         assert_eq!(roll.data_shreds_missing_pct, 3.13);
         assert_eq!(roll.txs_rebuilt_pct, 33.33);
@@ -325,22 +340,28 @@ mod tests {
         );
         assert_eq!(roll.kernel_drops, Some(3));
         assert_eq!(roll.bad_proof, 2);
+        assert_eq!(roll.events_dropped, Some(4));
+        assert_eq!(roll.publish_lag_ms, Some(3.21));
     }
 
     #[test]
     fn test_old_slots_leave_the_window() {
         let mut r = Rollups::default();
-        r.tick(100 * S, &packets(0), || None);
+        r.tick(100 * S, &packets(0), || None, || None);
         r.add(&set(1, 100 * S, 60 * MS, &[]));
         r.add(&slot(1, 100 * S));
         assert_eq!(
-            r.tick(105 * S, &packets(0), || None).unwrap().slots_closed,
+            r.tick(105 * S, &packets(0), || None, || None)
+                .unwrap()
+                .slots_closed,
             1
         );
         // 61 s on, the slot and its set are older than the window
-        let roll = r.tick(161 * S, &packets(0), || None).unwrap();
+        let roll = r.tick(161 * S, &packets(0), || None, || None).unwrap();
         assert_eq!(roll.slots_closed, 0);
         assert_eq!(roll.set_fill_ms, None);
         assert_eq!(roll.data_shreds_missing_pct, 0.0);
+        // nothing publishes, so there is nothing to report
+        assert_eq!((roll.events_dropped, roll.publish_lag_ms), (None, None));
     }
 }

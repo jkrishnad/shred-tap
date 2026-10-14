@@ -238,6 +238,30 @@ pub trait EventSink {
     fn public(&mut self, message: &Public) -> Result<()>;
     /// Pushes anything still buffered out.
     fn flush(&mut self) -> Result<()>;
+    /// How a sink that publishes is keeping up, None for one that only writes.
+    fn published(&mut self) -> Option<Published> {
+        None
+    }
+}
+
+/// How a publishing sink is keeping up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Published {
+    /// Messages dropped or lost since the start, because the queue was full or the publish failed.
+    pub dropped: u64,
+    /// Longest wait from queue to the server since the last time this was read, None if nothing went out.
+    pub lag_ns: Option<u64>,
+}
+
+/// One event as the JSON of its line in the files, without the kind tag.
+#[cfg(feature = "nats")]
+pub(crate) fn untagged_json(event: &Event) -> Result<Vec<u8>> {
+    Ok(match Record::from(event) {
+        Record::Tx(r) => serde_json::to_vec(&r)?,
+        Record::Marker(r) => serde_json::to_vec(&r)?,
+        Record::Set(r) => serde_json::to_vec(&r)?,
+        Record::Slot(r) => serde_json::to_vec(&r)?,
+    })
 }
 
 /// One file per kind. W is any writer, files on disk or a Vec<u8> in tests.

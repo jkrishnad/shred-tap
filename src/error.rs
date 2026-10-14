@@ -76,6 +76,9 @@ pub enum Error {
     /// The live capture on a network interface failed, for example no permission to open it.
     #[error("live capture: {0}")]
     Capture(String),
+    /// Connecting or publishing to NATS failed.
+    #[error("nats: {0}")]
+    Nats(String),
     /// Reading the capture failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

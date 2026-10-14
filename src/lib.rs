@@ -13,6 +13,7 @@
 //! 6. assembler runs all of the above on a live or recorded stream, in the right order, with timing.
 //! 7. record writes the assembler's events as JSON lines and the run's totals as a summary.
 //!    rollup sums up the last minute every 5 s, and feed makes the small public slot summaries.
+//!    nats publishes the same events to a NATS server, behind the nats feature.
 //!
 //! error holds the one Error type every module returns.
 pub mod assembler;
@@ -25,6 +26,8 @@ pub mod feed;
 pub mod footer;
 pub mod leaders;
 pub mod merkle;
+#[cfg(feature = "nats")]
+pub mod nats;
 pub mod pcap;
 pub mod record;
 pub mod rollup;
