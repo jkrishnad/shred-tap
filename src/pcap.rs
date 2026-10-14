@@ -34,6 +34,20 @@ pub struct Record {
 pub trait PacketSource {
     /// The next frame, None once the input has ended.
     fn next_record(&mut self) -> Result<Option<Record>>;
+
+    /// Packets lost before they reached us, None when the source can't tell, like a file.
+    fn drops(&mut self) -> Option<Drops> {
+        None
+    }
+}
+
+/// Packets a live capture lost, from libpcap's counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Drops {
+    /// No room left in the kernel buffer, because packets were not read fast enough.
+    pub kernel: u32,
+    /// Dropped by the network card or its driver.
+    pub interface: u32,
 }
 
 /// Reads records one at a time, so a file and a live pipe from tcpdump work the same way.

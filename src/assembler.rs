@@ -121,6 +121,17 @@ pub enum SlotEnd {
     EndOfInput,
 }
 
+impl SlotEnd {
+    /// The name written in the output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotEnd::Complete => "complete",
+            SlotEnd::GivenUp => "given_up",
+            SlotEnd::EndOfInput => "end_of_input",
+        }
+    }
+}
+
 /// Shred health counters for the report.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Stats {

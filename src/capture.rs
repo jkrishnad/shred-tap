@@ -7,7 +7,7 @@
 //! Opening an interface needs root or the cap_net_raw and cap_net_admin capabilities.
 
 use crate::error::{Error, Result};
-use crate::pcap::{PacketSource, Record};
+use crate::pcap::{Drops, PacketSource, Record};
 use pcap::{Active, Capture, Direction, Precision};
 
 /// UDP length field is the 8 byte header plus the payload, 1211 for a data shred, 1236 for coding.
@@ -24,15 +24,6 @@ pub struct LiveCapture {
     cap: Capture<Active>,
 }
 
-/// Packets the capture lost, read from libpcap's counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Drops {
-    /// No room left in the kernel buffer, because packets were not read fast enough.
-    pub kernel: u32,
-    /// Dropped by the network card or its driver.
-    pub interface: u32,
-}
-
 impl LiveCapture {
     /// Opens the interface and starts capturing shreds.
     pub fn open(interface: &str) -> Result<Self> {
@@ -46,15 +37,6 @@ impl LiveCapture {
         cap.direction(Direction::In)?;
         cap.filter(SHRED_FILTER, true)?;
         Ok(Self { cap })
-    }
-
-    /// What the kernel and the card have dropped since the capture opened.
-    pub fn drops(&mut self) -> Result<Drops> {
-        let stat = self.cap.stats()?;
-        Ok(Drops {
-            kernel: stat.dropped,
-            interface: stat.if_dropped,
-        })
     }
 }
 
@@ -79,6 +61,15 @@ impl PacketSource for LiveCapture {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// What the kernel and the card have dropped since the capture opened.
+    fn drops(&mut self) -> Option<Drops> {
+        let stat = self.cap.stats().ok()?;
+        Some(Drops {
+            kernel: stat.dropped,
+            interface: stat.if_dropped,
+        })
     }
 }
 

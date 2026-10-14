@@ -2,7 +2,8 @@
 //!
 //! Every event becomes one small record, a flat struct whose fields serde writes in order.
 //! An EventSink is where those records go. Output writes one file per kind: transactions
-//! to tx.jsonl, block markers to markers.jsonl, FEC sets to sets.jsonl and slots to slots.jsonl.
+//! to tx.jsonl, block markers to markers.jsonl, FEC sets to sets.jsonl, slots to slots.jsonl
+//! and the compact public feed, slot summaries and rollups, to public.jsonl.
 //! LineSink writes every kind to one stream, each line tagged with its kind and flushed at once,
 //! so a reader such as a terminal on stdout sees each event the moment it happens.
 //! Both are generic over the writer, files or stdout for a real run and Vec<u8> in tests.
@@ -14,8 +15,9 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::assembler::{Event, SlotEnd, Stats, Timing};
+use crate::assembler::{Event, Stats, Timing};
 use crate::error::Result;
+use crate::feed::Public;
 use crate::footer::{FinalCert, Footer, RewardCert, Signers};
 use solana_hash::Hash;
 
@@ -127,7 +129,7 @@ impl<'a> From<&'a Footer> for FooterRecord<'a> {
     }
 }
 
-fn base58(bytes: [u8; 32]) -> String {
+pub(crate) fn base58(bytes: [u8; 32]) -> String {
     Hash::new_from_array(bytes).to_string()
 }
 
@@ -222,11 +224,7 @@ impl<'a> From<&'a Event> for Record<'a> {
                 txs: *txs,
                 late_data: *late_data,
                 footer: footer.as_ref().map(FooterRecord::from),
-                end: match end {
-                    SlotEnd::Complete => "complete",
-                    SlotEnd::GivenUp => "given_up",
-                    SlotEnd::EndOfInput => "end_of_input",
-                },
+                end: end.as_str(),
             }),
         }
     }
@@ -236,6 +234,8 @@ impl<'a> From<&'a Event> for Record<'a> {
 pub trait EventSink {
     /// Writes one event.
     fn write(&mut self, event: &Event) -> Result<()>;
+    /// Writes one message of the public feed.
+    fn public(&mut self, message: &Public) -> Result<()>;
     /// Pushes anything still buffered out.
     fn flush(&mut self) -> Result<()>;
 }
@@ -246,15 +246,17 @@ pub struct Output<W> {
     pub markers: W,
     pub sets: W,
     pub slots: W,
+    pub public: W,
 }
 
 impl<W: Write> Output<W> {
-    pub fn new(tx: W, markers: W, sets: W, slots: W) -> Self {
+    pub fn new(tx: W, markers: W, sets: W, slots: W, public: W) -> Self {
         Self {
             tx,
             markers,
             sets,
             slots,
+            public,
         }
     }
 }
@@ -270,11 +272,16 @@ impl<W: Write> EventSink for Output<W> {
         }
     }
 
+    fn public(&mut self, message: &Public) -> Result<()> {
+        write_line(&mut self.public, message)
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.tx.flush()?;
         self.markers.flush()?;
         self.sets.flush()?;
         self.slots.flush()?;
+        self.public.flush()?;
         Ok(())
     }
 }
@@ -298,6 +305,12 @@ impl<W: Write> EventSink for LineSink<W> {
         Ok(())
     }
 
+    fn public(&mut self, message: &Public) -> Result<()> {
+        write_line(&mut self.out, message)?;
+        self.out.flush()?;
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.out.flush()?;
         Ok(())
@@ -317,6 +330,7 @@ impl Output<BufWriter<File>> {
             open("markers.jsonl")?,
             open("sets.jsonl")?,
             open("slots.jsonl")?,
+            open("public.jsonl")?,
         ))
     }
 }
@@ -338,7 +352,7 @@ fn write_line(w: &mut impl Write, record: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembler::{Event, Stats, Timing};
+    use crate::assembler::{Event, SlotEnd, Stats, Timing};
     use solana_transaction::Signature;
     use std::str::FromStr;
 
@@ -385,7 +399,7 @@ mod tests {
     }
 
     fn memory_output() -> Output<Vec<u8>> {
-        Output::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        Output::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
     }
 
     fn lines(buf: &[u8]) -> Vec<String> {
@@ -611,7 +625,13 @@ mod tests {
         })
         .unwrap();
         out.flush().unwrap();
-        for name in ["tx.jsonl", "markers.jsonl", "sets.jsonl", "slots.jsonl"] {
+        for name in [
+            "tx.jsonl",
+            "markers.jsonl",
+            "sets.jsonl",
+            "slots.jsonl",
+            "public.jsonl",
+        ] {
             assert!(dir.join(name).exists(), "{name}");
         }
         let tx = std::fs::read_to_string(dir.join("tx.jsonl")).unwrap();

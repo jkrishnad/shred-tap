@@ -4,7 +4,8 @@
 //! live, built with the live feature, reads shreds straight from a network interface.
 //! Both run every packet through the assembler the same way, in run, and write the events
 //! and a summary into a folder, or with --out - stream every event to stdout as one JSON line,
-//! the moment it happens. The totals are printed on stderr, so they never mix with the events.
+//! the moment it happens, with the compact public feed: a summary per slot and a rollup
+//! of the last minute every 5 s. The totals are printed on stderr, so they never mix with the events.
 //! With --leader-schedule every FEC set's signature is checked against its slot's leader.
 //! All the work happens in the library, this file only parses arguments and reports errors.
 
@@ -15,9 +16,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use shredtap::assembler::{Assembler, DEFAULT_SLOT_NS, Stats};
+use shredtap::feed::{Feed, Public};
 use shredtap::leaders::LeaderSchedule;
 use shredtap::pcap::{PacketSource, PcapReader, udp_payload};
 use shredtap::record::{EventSink, LineSink, Output, write_summary};
+use shredtap::rollup::Rollups;
 
 #[derive(Parser)]
 #[command(
@@ -110,14 +113,32 @@ fn run(source: &mut dyn PacketSource, options: &Options) -> Result<()> {
         assembler = assembler.with_leaders(leaders);
     }
 
+    let mut feed = Feed::default();
+    let mut rollups = Rollups::default();
     while let Some(record) = source.next_record().context("reading packets")? {
         if let Some(payload) = udp_payload(&record.frame) {
             for event in assembler.push(payload, record.recv_ns) {
+                rollups.add(&event);
+                if let Some(summary) = feed.add(&event) {
+                    output
+                        .public(&Public::Summary(summary))
+                        .context("writing summary")?;
+                }
                 output.write(&event).context("writing event")?;
             }
         }
+        if let Some(rollup) = rollups.tick(record.recv_ns, assembler.stats(), || source.drops()) {
+            output
+                .public(&Public::Stats(rollup))
+                .context("writing rollup")?;
+        }
     }
     for event in assembler.finish() {
+        if let Some(summary) = feed.add(&event) {
+            output
+                .public(&Public::Summary(summary))
+                .context("writing summary")?;
+        }
         output.write(&event).context("writing event")?;
     }
     output.flush().context("flushing output")?;
