@@ -1,0 +1,27 @@
+[Unit]
+Description=NATS server for shredtap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nats
+Group=nats
+ExecStart=/usr/local/bin/nats-server -c /etc/nats/nats.conf
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+# the validator always comes first
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=512M
+Environment=GOMEMLIMIT=400MiB
+# creates /var/lib/nats owned by the nats user
+StateDirectory=nats
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -45,7 +45,7 @@ enum Command {
     /// Capture shreds live from a network interface and decode them as they arrive
     #[cfg(feature = "live")]
     Live {
-        /// Network interface the shreds arrive on, like ens3f0np0
+        /// Network interface the shreds arrive on, like eth0
         #[arg(long)]
         interface: String,
         #[command(flatten)]

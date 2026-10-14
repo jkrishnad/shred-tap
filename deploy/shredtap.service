@@ -1,0 +1,26 @@
+[Unit]
+Description=shredtap live, decodes the shreds reaching the validator and publishes them to NATS
+After=nats.service
+Wants=nats.service
+
+[Service]
+User=sol
+Group=sol
+# node values live only on the node, SHREDTAP_INTERFACE=<interface> in this file
+EnvironmentFile=/etc/shredtap/env
+ExecStart=/usr/local/bin/shredtap live --interface ${SHREDTAP_INTERFACE} --nats 127.0.0.1:4222
+Restart=always
+RestartSec=5
+# opening the interface for a passive copy of its packets, without running as root
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+# the validator always comes first
+Nice=19
+MemoryMax=512M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
