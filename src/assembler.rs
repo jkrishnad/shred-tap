@@ -255,6 +255,12 @@ impl Assembler {
         self
     }
 
+    /// Swaps in a new schedule while running. An empty one turns the check off rather than
+    /// turning every shred away, so a folder with no files yet does not stop the decoding.
+    pub fn set_leaders(&mut self, leaders: LeaderSchedule) {
+        self.leaders = (!leaders.is_empty()).then_some(leaders);
+    }
+
     /// Feeds one UDP payload. Returns whatever this packet made decodable.
     pub fn push(&mut self, payload: &[u8], recv_ns: u64) -> Vec<Event> {
         self.stats.packets += 1;
@@ -918,6 +924,12 @@ mod tests {
         let mut asm = Assembler::new().with_leaders(LeaderSchedule::default());
         assert!(signatures(&run_with(&mut asm, &arrivals())).is_empty());
         assert_eq!(asm.stats().no_leader, 255);
+
+        // swapping in an empty schedule while running turns the check off instead
+        let mut asm = Assembler::new().with_leaders(leaders());
+        asm.set_leaders(LeaderSchedule::default());
+        assert_eq!(signatures(&run_with(&mut asm, &arrivals())).len(), 26);
+        assert_eq!(asm.stats().no_leader, 0);
     }
 
     #[test]

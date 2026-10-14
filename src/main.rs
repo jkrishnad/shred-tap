@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use shredtap::assembler::{Assembler, DEFAULT_SLOT_NS, Stats};
 use shredtap::feed::{Feed, Public};
-use shredtap::leaders::LeaderSchedule;
+use shredtap::leaders::{LeaderDir, LeaderSchedule};
 use shredtap::pcap::{PacketSource, PcapReader, udp_payload};
 use shredtap::record::{EventSink, LineSink, Output, write_summary};
 use shredtap::rollup::Rollups;
@@ -69,6 +69,9 @@ struct Options {
     /// Output of solana leader-schedule, repeat it for a capture that spans epochs
     #[arg(long)]
     leader_schedule: Vec<PathBuf>,
+    /// Folder of leader schedule files, one per epoch, read again whenever a file in it changes
+    #[arg(long, conflicts_with = "leader_schedule")]
+    leader_schedule_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -114,7 +117,21 @@ fn run(source: &mut dyn PacketSource, options: &Options) -> Result<()> {
 
     let mut feed = Feed::default();
     let mut rollups = Rollups::default();
+    let mut leader_dir = options.leader_schedule_dir.as_deref().map(LeaderDir::new);
+    if let Some(dir) = &mut leader_dir {
+        reload_leaders(dir, &mut assembler);
+    }
+    let mut next_leader_check_ns = 0;
     while let Some(record) = source.next_record().context("reading packets")? {
+        // a new epoch's schedule is picked up within a minute, without a restart
+        if let Some(dir) = &mut leader_dir {
+            if next_leader_check_ns == 0 {
+                next_leader_check_ns = record.recv_ns + LEADER_CHECK_NS;
+            } else if record.recv_ns >= next_leader_check_ns {
+                next_leader_check_ns = record.recv_ns + LEADER_CHECK_NS;
+                reload_leaders(dir, &mut assembler);
+            }
+        }
         if let Some(payload) = udp_payload(&record.frame) {
             for event in assembler.push(payload, record.recv_ns) {
                 rollups.add(&event);
@@ -156,6 +173,21 @@ fn run(source: &mut dyn PacketSource, options: &Options) -> Result<()> {
 
     print_summary(assembler.stats(), folder);
     Ok(())
+}
+
+/// How often a live run looks for a changed leader schedule folder, on the capture clock.
+const LEADER_CHECK_NS: u64 = 60_000_000_000;
+
+/// Loads the folder again if it changed. A folder that can't be read keeps the schedule loaded.
+fn reload_leaders(dir: &mut LeaderDir, assembler: &mut Assembler) {
+    match dir.changed() {
+        Ok(Some(leaders)) => {
+            eprintln!("leader schedule: {} slots", leaders.len());
+            assembler.set_leaders(leaders);
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("leader schedule: {e}, keeping the one loaded"),
+    }
 }
 
 /// The sink the options ask for: NATS, a folder of files, or stdout.

@@ -5,10 +5,15 @@
 //! leader's public key proves the whole set came from the leader, as Agave's sigverify does.
 //! The schedule is read from the text that solana leader-schedule prints,
 //! one slot and one base58 public key per line. Any other line is skipped.
+//! A LeaderDir is a folder of such files, one per epoch, that a live run reads again
+//! whenever a file in it is added, replaced or removed, so a new epoch needs no restart.
 
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::SystemTime;
 
 use solana_address::Address;
 use solana_signature::Signature;
@@ -59,6 +64,46 @@ impl LeaderSchedule {
     }
 }
 
+/// A folder of schedule files ending in .txt. Anything else, like a file still being written, is skipped.
+pub struct LeaderDir {
+    path: PathBuf,
+    /// Name, change time and size of every file at the last read.
+    stamp: Vec<(PathBuf, SystemTime, u64)>,
+}
+
+impl LeaderDir {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            stamp: Vec::new(),
+        }
+    }
+
+    /// Reads every file again if the folder changed since the last call, None if it did not.
+    /// Looking costs one stat per file, so it can be called often.
+    pub fn changed(&mut self) -> Result<Option<LeaderSchedule>> {
+        let mut stamp = Vec::new();
+        for entry in std::fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            let path = entry.path();
+            if meta.is_file() && path.extension().is_some_and(|e| e == "txt") {
+                stamp.push((path, meta.modified()?, meta.len()));
+            }
+        }
+        stamp.sort();
+        if stamp == self.stamp {
+            return Ok(None);
+        }
+        let mut schedule = LeaderSchedule::default();
+        for (path, ..) in &stamp {
+            schedule.read(BufReader::new(File::open(path)?))?;
+        }
+        self.stamp = stamp;
+        Ok(Some(schedule))
+    }
+}
+
 /// True if the shred's signature is the leader's signature over this Merkle root.
 pub fn signed_by(shred: &Shred, root: &Hash, leader: &Pubkey) -> bool {
     let Some(bytes) = shred.bytes.get(wire::SIGNATURE) else {
@@ -100,6 +145,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.len(), 58);
+    }
+
+    #[test]
+    fn test_folder_read_again_only_when_it_changes() {
+        let dir = std::env::temp_dir().join(format!("shredtap-leaders-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut leaders = LeaderDir::new(&dir);
+        // nothing to read yet, so there is no schedule and nothing is checked
+        assert!(leaders.changed().unwrap().is_none());
+
+        std::fs::write(dir.join("epoch-1053.txt"), LEADERS).unwrap();
+        assert_eq!(leaders.changed().unwrap().unwrap().len(), 57);
+        assert!(leaders.changed().unwrap().is_none());
+
+        // a file still being written is skipped, a finished one is added
+        std::fs::write(
+            dir.join("epoch-1054.txt.tmp"),
+            "  5  F1jcLYJ1s8k4oYVy51J2RvYGh4sB1kWsUB2NaDrg6ejL\n",
+        )
+        .unwrap();
+        assert!(leaders.changed().unwrap().is_none());
+        std::fs::rename(dir.join("epoch-1054.txt.tmp"), dir.join("epoch-1054.txt")).unwrap();
+        assert_eq!(leaders.changed().unwrap().unwrap().len(), 58);
+
+        // a past epoch removed
+        std::fs::remove_file(dir.join("epoch-1053.txt")).unwrap();
+        assert_eq!(leaders.changed().unwrap().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
