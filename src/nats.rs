@@ -2,7 +2,8 @@
 //!
 //! The capture thread never waits for NATS. NatsSink turns each event into its subject and
 //! the same JSON the files hold, and puts it on a bounded queue. One publisher thread takes
-//! messages off the queue and sends them, the only place that waits for the server.
+//! up to BATCH messages off the queue at a time, sends them all, then collects the server's
+//! acks together, so a slow ack holds up one batch instead of every message behind it.
 //! When the queue fills up, transactions are dropped first: above TX_ROOM a transaction
 //! is turned away, while slots, summaries and rollups still get in until QUEUE is reached.
 //! Every message dropped or lost is counted, and the longest wait is measured, so the next
@@ -31,6 +32,8 @@ use crate::record::{EventSink, Published, untagged_json};
 const QUEUE: usize = 4096;
 /// Above this many queued, transactions are dropped, so the rest still have room.
 const TX_ROOM: usize = QUEUE * 3 / 4;
+/// Messages sent before waiting for their acks.
+const BATCH: usize = 256;
 
 /// The stored subjects, each in its own stream so each keeps what it is worth.
 const STREAMS: [(&str, &str, Duration, i64); 3] = [
@@ -102,8 +105,8 @@ fn public_messages(message: &Public) -> Result<Vec<Message>> {
 #[derive(Default)]
 struct State {
     messages: VecDeque<Message>,
-    /// The publisher holds a message it has not finished with.
-    sending: bool,
+    /// Messages the publisher has taken and not finished with.
+    in_flight: usize,
     closed: bool,
     /// The publisher thread has stopped, so nothing will be sent any more.
     stopped: bool,
@@ -147,13 +150,14 @@ impl Queue {
         self.changed.notify_all();
     }
 
-    /// Waits for the next message, None once the queue is closed and empty.
-    fn pop(&self) -> Option<Message> {
+    /// Waits for messages and takes up to max of them, None once the queue is closed and empty.
+    fn pop_batch(&self, max: usize) -> Option<Vec<Message>> {
         let mut state = self.lock();
         loop {
-            if let Some(message) = state.messages.pop_front() {
-                state.sending = true;
-                return Some(message);
+            if !state.messages.is_empty() {
+                let n = state.messages.len().min(max);
+                state.in_flight += n;
+                return Some(state.messages.drain(..n).collect());
             }
             if state.closed {
                 return None;
@@ -168,7 +172,7 @@ impl Queue {
     /// The publisher is done with its message, sent after waiting `lag` or lost.
     fn done(&self, sent: bool, lag: Duration) {
         let mut state = self.lock();
-        state.sending = false;
+        state.in_flight = state.in_flight.saturating_sub(1);
         if sent {
             let lag_ns = u64::try_from(lag.as_nanos()).unwrap_or(u64::MAX);
             state.lag_ns = Some(state.lag_ns.map_or(lag_ns, |l| l.max(lag_ns)));
@@ -181,7 +185,7 @@ impl Queue {
     /// Waits until every queued message has been handled.
     fn wait_empty(&self) {
         let mut state = self.lock();
-        while (!state.messages.is_empty() || state.sending) && !state.stopped {
+        while (!state.messages.is_empty() || state.in_flight > 0) && !state.stopped {
             state = self
                 .changed
                 .wait(state)
@@ -198,7 +202,7 @@ impl Queue {
     fn stop(&self) {
         let mut state = self.lock();
         state.stopped = true;
-        state.sending = false;
+        state.in_flight = 0;
         state.dropped += state.messages.len() as u64;
         state.messages.clear();
         self.changed.notify_all();
@@ -274,7 +278,7 @@ impl Drop for StopOnExit<'_> {
     }
 }
 
-/// The publisher thread: one message at a time, stored ones wait for the server's ack.
+/// The publisher thread: sends a batch, then waits for the acks of its stored messages.
 fn publish_all(queue: &Queue, runtime: &Runtime, client: Client) {
     let _stop = StopOnExit(queue);
     // the JetStream context starts a task of its own, so it has to be made inside the runtime
@@ -282,27 +286,36 @@ fn publish_all(queue: &Queue, runtime: &Runtime, client: Client) {
         let _inside = runtime.enter();
         jetstream::new(client.clone())
     };
-    while let Some(message) = queue.pop() {
-        let sent = runtime.block_on(async {
-            match message.id {
-                Some(id) => {
-                    let mut headers = HeaderMap::new();
-                    headers.insert(header::NATS_MESSAGE_ID, id);
-                    match js
-                        .publish_with_headers(message.subject, headers, message.payload.into())
-                        .await
-                    {
-                        Ok(ack) => ack.await.is_ok(),
-                        Err(_) => false,
+    while let Some(batch) = queue.pop_batch(BATCH) {
+        runtime.block_on(async {
+            let mut acks = Vec::with_capacity(batch.len());
+            for message in batch {
+                match message.id {
+                    Some(id) => {
+                        let mut headers = HeaderMap::new();
+                        headers.insert(header::NATS_MESSAGE_ID, id);
+                        match js
+                            .publish_with_headers(message.subject, headers, message.payload.into())
+                            .await
+                        {
+                            Ok(ack) => acks.push((ack, message.queued)),
+                            Err(_) => queue.done(false, message.queued.elapsed()),
+                        }
+                    }
+                    None => {
+                        let sent = client
+                            .publish(message.subject, message.payload.into())
+                            .await
+                            .is_ok();
+                        queue.done(sent, message.queued.elapsed());
                     }
                 }
-                None => client
-                    .publish(message.subject, message.payload.into())
-                    .await
-                    .is_ok(),
+            }
+            // the whole batch is on its way, so the acks come back together
+            for (ack, queued) in acks {
+                queue.done(ack.await.is_ok(), queued.elapsed());
             }
         });
-        queue.done(sent, message.queued.elapsed());
     }
 }
 
@@ -456,17 +469,22 @@ mod tests {
         let queue = Queue::new();
         queue.push(message("shred.tx"));
         queue.push(message("shred.slot"));
-        assert_eq!(queue.pop().unwrap().subject, "shred.tx");
+        queue.push(message("shred.public"));
+        // a batch takes the oldest first, and no more than asked
+        let batch = queue.pop_batch(2).unwrap();
+        let subjects: Vec<_> = batch.iter().map(|m| m.subject).collect();
+        assert_eq!(subjects, ["shred.tx", "shred.slot"]);
         queue.done(true, Duration::from_millis(3));
-        assert_eq!(queue.pop().unwrap().subject, "shred.slot");
         queue.done(false, Duration::ZERO);
+        assert_eq!(queue.pop_batch(BATCH).unwrap().len(), 1);
+        queue.done(true, Duration::ZERO);
         let published = queue.published();
         assert_eq!(published.dropped, 1);
         assert_eq!(published.lag_ns, Some(3_000_000));
         // the longest wait is reset once it is read
         assert_eq!(queue.published().lag_ns, None);
         queue.close();
-        assert!(queue.pop().is_none());
+        assert!(queue.pop_batch(BATCH).is_none());
     }
 
     #[test]
