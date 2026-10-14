@@ -28,7 +28,6 @@ pub enum Public {
 /// One closed slot, small enough to send for every slot.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Summary {
-    pub v: u8,
     pub slot: u64,
     /// base58, null without a leader schedule.
     pub leader: Option<String>,
@@ -105,7 +104,6 @@ impl Feed {
             } => {
                 let open = self.open.remove(slot).unwrap_or_default();
                 Some(Summary {
-                    v: 1,
                     slot: *slot,
                     leader: leader.map(base58),
                     first_shred_ns: *first_shred_ns,
@@ -207,10 +205,7 @@ mod tests {
         }
         let s = feed.add(&slot(9, 10)).unwrap();
         let line = serde_json::to_string(&Public::Summary(s)).unwrap();
-        assert!(
-            line.starts_with(r#"{"kind":"summary","v":1,"slot":9,"#),
-            "{line}"
-        );
+        assert!(line.starts_with(r#"{"kind":"summary","slot":9,"#), "{line}");
         assert!(line.len() < 500, "{} bytes: {line}", line.len());
     }
 

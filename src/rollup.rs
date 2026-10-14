@@ -23,7 +23,6 @@ pub const EVERY_NS: u64 = 5_000_000_000;
 /// One summary of the last minute.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Rollup {
-    pub v: u8,
     /// Capture time the rollup was made.
     pub at_ns: u64,
     pub window_s: u64,
@@ -165,7 +164,6 @@ impl Rollups {
         fills.sort_unstable();
 
         Some(Rollup {
-            v: 1,
             at_ns: now_ns,
             window_s: WINDOW_NS / 1_000_000_000,
             packets_per_s: (u128::from(packets) * 1_000_000_000 / u128::from(elapsed)) as u64,
