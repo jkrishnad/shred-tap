@@ -9,9 +9,9 @@
 //! Every message dropped or lost is counted, and the longest wait is measured, so the next
 //! rollup can show when the publisher falls behind.
 //!
-//! shred.tx, shred.slot and shred.stats are stored in JetStream streams, each message with a
-//! Nats-Msg-Id so a resend inside the duplicate window is not stored twice. The streams are
-//! made on connect if they are missing. shred.public is a plain publish, not stored, live only.
+//! shred.slot and shred.stats are stored in JetStream streams, each message with a Nats-Msg-Id
+//! so a resend inside the duplicate window is not stored twice. The streams are made on connect
+//! if they are missing. shred.tx and shred.public are plain publishes, not stored, live only.
 //! The async client runs on its own small tokio runtime, so the rest of shredtap stays sync.
 
 use std::collections::VecDeque;
@@ -38,8 +38,7 @@ const TX_ROOM: usize = QUEUE * 3 / 4;
 const BATCH: usize = 256;
 
 /// The stored subjects, each in its own stream so each keeps what it is worth.
-const STREAMS: [(&str, &str, Duration, i64); 3] = [
-    ("SHRED_TX", "shred.tx", Duration::from_secs(3600), 512 << 20),
+const STREAMS: [(&str, &str, Duration, i64); 2] = [
     (
         "SHRED_SLOT",
         "shred.slot",
@@ -74,16 +73,15 @@ impl Message {
     }
 }
 
-/// The messages for one event: a transaction or a closed slot, nothing for sets and markers.
+/// The messages for one event: a transaction, live only, or a closed slot, stored.
+/// Nothing for sets and markers.
 fn event_messages(event: &Event) -> Result<Option<Message>> {
     let (subject, id) = match event {
-        Event::Tx {
-            slot, signature, ..
-        } => ("shred.tx", format!("{slot}:{signature}")),
-        Event::Slot { slot, .. } => ("shred.slot", slot.to_string()),
+        Event::Tx { .. } => ("shred.tx", None),
+        Event::Slot { slot, .. } => ("shred.slot", Some(slot.to_string())),
         _ => return Ok(None),
     };
-    Ok(Some(Message::new(subject, Some(id), untagged_json(event)?)))
+    Ok(Some(Message::new(subject, id, untagged_json(event)?)))
 }
 
 /// The messages for one public message: a summary goes on shred.public,
@@ -406,8 +404,8 @@ mod tests {
     #[test]
     fn test_subjects_and_ids() {
         let m = event_messages(&tx(7)).unwrap().unwrap();
-        assert_eq!(m.subject, "shred.tx");
-        assert_eq!(m.id.unwrap(), format!("7:{}", Signature::default()));
+        // live only, so no message id
+        assert_eq!((m.subject, m.id.is_none()), ("shred.tx", true));
         // the same JSON as the line in tx.jsonl, no kind tag
         let json: serde_json::Value = serde_json::from_slice(&m.payload).unwrap();
         assert_eq!(json["slot"], 7);
@@ -567,6 +565,7 @@ mod tests {
             .runtime
             .block_on(reader.subscribe("shred.public"))
             .unwrap();
+        let mut tx_sub = sink.runtime.block_on(reader.subscribe("shred.tx")).unwrap();
         sink.runtime.block_on(reader.flush()).unwrap();
 
         let mut reader_pcap = PcapReader::new(std::io::BufReader::new(file)).unwrap();
@@ -606,30 +605,32 @@ mod tests {
         sink.flush().unwrap();
         assert_eq!(sink.published().unwrap().dropped, 0);
 
-        // every transaction and slot is stored, and the reader got every public message
-        let stored = |name: &str| {
+        // every slot is stored, transactions are not, and the readers got every live message
+        let (slots_stored, tx_stream) = sink.runtime.block_on(async {
+            let js = jetstream::new(reader.clone());
+            let mut stream = js.get_stream("SHRED_SLOT").await.unwrap();
+            let slots_stored = stream.info().await.unwrap().state.messages;
+            (slots_stored, js.get_stream("SHRED_TX").await.is_ok())
+        });
+        assert_eq!(slots_stored, slots);
+        assert!(!tx_stream);
+        assert!(txs > 2_000 && slots > 40, "{txs} txs, {slots} slots");
+        let received = |sub: &mut async_nats::Subscriber, want: u64| {
             sink.runtime.block_on(async {
-                let js = jetstream::new(reader.clone());
-                let mut stream = js.get_stream(name).await.unwrap();
-                stream.info().await.unwrap().state.messages
+                let mut got = 0;
+                while got < want {
+                    match tokio::time::timeout(Duration::from_secs(5), sub.next()).await {
+                        Ok(Some(_)) => got += 1,
+                        _ => break,
+                    }
+                }
+                got
             })
         };
-        assert_eq!(stored("SHRED_TX"), txs);
-        assert_eq!(stored("SHRED_SLOT"), slots);
-        assert!(txs > 2_000 && slots > 40, "{txs} txs, {slots} slots");
-        let got = sink.runtime.block_on(async {
-            let mut got = 0;
-            while got < public {
-                match tokio::time::timeout(Duration::from_secs(5), sub.next()).await {
-                    Ok(Some(_)) => got += 1,
-                    _ => break,
-                }
-            }
-            got
-        });
-        assert_eq!(got, public);
-        // the subscriber unsubscribes with a task of its own when dropped
+        assert_eq!(received(&mut sub, public), public);
+        assert_eq!(received(&mut tx_sub, txs), txs);
+        // a subscriber unsubscribes with a task of its own when dropped
         let _inside = sink.runtime.enter();
-        drop(sub);
+        drop((sub, tx_sub));
     }
 }
