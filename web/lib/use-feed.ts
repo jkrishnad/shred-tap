@@ -46,7 +46,8 @@ export function useFeed(): Feed {
         if (m.kind === "summary") {
           s.slots.set(m.slot, m);
           s.maxSlot = Math.max(s.maxSlot, m.slot);
-          s.firstSlot = s.firstSlot ? Math.min(s.firstSlot, m.slot) : m.slot;
+          // the first slot seen marks when the page opened, a late straggler from before it does not move it
+          if (!s.firstSlot) s.firstSlot = m.slot;
           for (const k of s.slots.keys()) if (k < s.maxSlot - SLOTS_KEPT) s.slots.delete(k);
           s.samples = [...m.sample.map((t) => ({ ...t, slot: m.slot })), ...s.samples].slice(0, SAMPLES_KEPT);
           s.lastAt = Date.now();

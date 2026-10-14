@@ -69,7 +69,7 @@ export default function Dashboard() {
     const s = feed.slots.get(slot);
     return { slot, missing: s ? (s.end === "complete" ? s.data_missing : null) : null, state: slotState(s) };
   });
-  const rows = [...feed.slots.values()].sort((a, b) => b.slot - a.slot).slice(0, 10);
+  const rows = [...feed.slots.values()].sort((a, b) => b.slot - a.slot).slice(0, 14);
   const series = feed.stats.map((s, i) => ({ i, ...s, p50: s.set_fill_ms?.p50, p99: s.set_fill_ms?.p99 }));
   const h = feed.connection === "live" ? health(last) : "none";
 
