@@ -8,6 +8,7 @@ const mono = IBM_Plex_Mono({ variable: "--font-mono", subsets: ["latin"], weight
 export const metadata: Metadata = {
   title: "Vyra Shreds",
   description: "Live shreds reaching the Vyra Labs testnet validator, decoded on the node.",
+  icons: { icon: { url: "/favicon-48.png", type: "image/png", sizes: "48x48" } },
 };
 
 // the design is light only, so browsers that darken pages on their own leave it as is
