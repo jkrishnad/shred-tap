@@ -32,6 +32,8 @@ pub struct Rollup {
     /// Lost by the kernel since the capture opened, null from a file.
     pub kernel_drops: Option<u32>,
     pub slots_closed: u32,
+    /// Closed slots that never completed, given up at their deadline.
+    pub slots_given_up: u32,
     /// Slot numbers in the window that had no shred at all.
     pub slots_never_came: u32,
     /// Of the data shreds in complete slots, the share that never arrived.
@@ -176,6 +178,7 @@ impl Rollups {
             packets_per_s: (u128::from(packets) * 1_000_000_000 / u128::from(elapsed)) as u64,
             kernel_drops: drops().map(|d| d.kernel),
             slots_closed: self.slots.len() as u32,
+            slots_given_up: self.slots.iter().filter(|s| !s.complete).count() as u32,
             slots_never_came: self.never_came(),
             data_shreds_missing_pct: percent(data_missing, data_shreds),
             set_fill_ms: (!fills.is_empty()).then(|| Fill {
@@ -301,7 +304,11 @@ mod tests {
         let mut r = Rollups::default();
         r.tick(100 * S, &packets(0), || None, || None);
         // slot 10 lost 2 of 32 data shreds and 1 of its 2 txs holds rebuilt bytes.
-        // slot 11 never came. slot 12 lost nothing
+        // slot 11 never came. slot 12 lost nothing. slot 13 was given up, so it adds no data
+        let mut given_up = slot(13, 101 * S);
+        if let Event::Slot { end, .. } = &mut given_up {
+            *end = SlotEnd::GivenUp;
+        }
         for e in [
             set(10, 100 * S, 60 * MS, &[3, 9]),
             tx(10, true),
@@ -310,6 +317,7 @@ mod tests {
             set(12, 101 * S, 100 * MS, &[]),
             tx(12, false),
             slot(12, 101 * S),
+            given_up,
         ] {
             r.add(&e);
         }
@@ -328,7 +336,14 @@ mod tests {
         let roll = r
             .tick(105 * S, &stats, || Some(drops), || Some(published))
             .unwrap();
-        assert_eq!((roll.slots_closed, roll.slots_never_came), (2, 1));
+        assert_eq!(
+            (
+                roll.slots_closed,
+                roll.slots_given_up,
+                roll.slots_never_came
+            ),
+            (3, 1, 1)
+        );
         assert_eq!(roll.data_shreds_missing_pct, 3.13);
         assert_eq!(roll.txs_rebuilt_pct, 33.33);
         assert_eq!(
