@@ -8,7 +8,7 @@ User=sol
 Group=sol
 # node values live only on the node, SHREDTAP_INTERFACE=<interface> in this file
 EnvironmentFile=/etc/shredtap/env
-ExecStart=/usr/local/bin/shredtap live --interface ${SHREDTAP_INTERFACE} --nats 127.0.0.1:4222
+ExecStart=/usr/local/bin/shredtap live --interface ${SHREDTAP_INTERFACE} --nats 127.0.0.1:4222 --leader-schedule-dir /var/lib/shredtap/leaders
 Restart=always
 RestartSec=5
 # opening the interface for a passive copy of its packets, without running as root

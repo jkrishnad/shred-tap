@@ -1,0 +1,19 @@
+[Unit]
+Description=Save the leader schedule of this epoch and the next for shredtap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sol
+Group=sol
+# node values live only on the node: SOLANA=<path to the solana cli> in this file
+EnvironmentFile=/etc/shredtap/env
+ExecStart=/usr/local/bin/shredtap-leaders /var/lib/shredtap/leaders
+# creates /var/lib/shredtap owned by sol, the only place this writes
+StateDirectory=shredtap
+Nice=19
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
