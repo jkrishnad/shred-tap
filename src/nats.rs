@@ -12,9 +12,16 @@
 //! shred.slot and shred.stats are stored in JetStream streams, each message with a Nats-Msg-Id
 //! so a resend inside the duplicate window is not stored twice. The streams are made on connect
 //! if they are missing. shred.tx and shred.public are plain publishes, not stored, live only.
+//!
+//! So a page opens full instead of empty, NatsSink also keeps the last HISTORY_SLOTS summaries,
+//! HISTORY_STATS rollups and HISTORY_SAMPLES sampled transactions, and every time a rollup goes
+//! out it stores them as one snapshot on shred.history. That stream keeps only the latest message,
+//! on disk so a NATS restart keeps it, and a page reads it once with a JetStream direct get.
 //! The async client runs on its own small tokio runtime, so the rest of shredtap stays sync.
 
 use std::collections::VecDeque;
+
+use serde::Serialize;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -25,8 +32,9 @@ use tokio::runtime::Runtime;
 
 use crate::assembler::Event;
 use crate::error::{Error, Result};
-use crate::feed::Public;
+use crate::feed::{Public, Summary};
 use crate::record::{EventSink, Published, untagged_json};
+use crate::rollup::Rollup;
 
 /// Messages the queue holds before it drops. A slot's transactions all arrive at once when it
 /// closes, and a busy slot can hold tens of thousands, so the queue has room for the biggest.
@@ -52,6 +60,80 @@ const STREAMS: [(&str, &str, Duration, i64); 2] = [
         64 << 20,
     ),
 ];
+
+/// The snapshot stream: only the latest message, readable with a direct get.
+const HISTORY_STREAM: &str = "SHRED_HISTORY";
+/// Slots in the snapshot, the page's slot strip.
+const HISTORY_SLOTS: usize = 120;
+/// Rollups in the snapshot, ten minutes of them.
+const HISTORY_STATS: usize = 120;
+/// Sampled transactions in the snapshot, the page's list.
+const HISTORY_SAMPLES: usize = 8;
+
+/// What a page needs to open full.
+#[derive(Default)]
+struct History {
+    /// Summaries without their samples, which are kept apart.
+    slots: VecDeque<Summary>,
+    stats: VecDeque<Rollup>,
+    /// Newest first.
+    samples: VecDeque<HistorySample>,
+}
+
+#[derive(Serialize)]
+struct HistorySample {
+    sig: String,
+    rebuilt: bool,
+    slot: u64,
+}
+
+/// The JSON of one snapshot, tagged like the messages on shred.public.
+#[derive(Serialize)]
+struct Snapshot<'a> {
+    kind: &'static str,
+    slots: &'a VecDeque<Summary>,
+    stats: &'a VecDeque<Rollup>,
+    samples: &'a VecDeque<HistorySample>,
+}
+
+impl History {
+    fn add(&mut self, message: &Public) {
+        match message {
+            Public::Summary(summary) => {
+                for t in summary.sample.iter().rev() {
+                    self.samples.push_front(HistorySample {
+                        sig: t.sig.clone(),
+                        rebuilt: t.rebuilt,
+                        slot: summary.slot,
+                    });
+                }
+                self.samples.truncate(HISTORY_SAMPLES);
+                self.slots.push_back(Summary {
+                    sample: Vec::new(),
+                    ..summary.clone()
+                });
+                if self.slots.len() > HISTORY_SLOTS {
+                    self.slots.pop_front();
+                }
+            }
+            Public::Stats(rollup) => {
+                self.stats.push_back(rollup.clone());
+                if self.stats.len() > HISTORY_STATS {
+                    self.stats.pop_front();
+                }
+            }
+        }
+    }
+
+    fn json(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&Snapshot {
+            kind: "history",
+            slots: &self.slots,
+            stats: &self.stats,
+            samples: &self.samples,
+        })?)
+    }
+}
 
 /// One message waiting to go out.
 struct Message {
@@ -224,6 +306,7 @@ pub struct NatsSink {
     runtime: Arc<Runtime>,
     client: Client,
     publisher: Option<JoinHandle<()>>,
+    history: History,
 }
 
 impl NatsSink {
@@ -249,6 +332,16 @@ impl NatsSink {
                 .await
                 .map_err(nats_error)?;
             }
+            js.get_or_create_stream(stream::Config {
+                name: HISTORY_STREAM.to_string(),
+                subjects: vec!["shred.history".to_string()],
+                max_messages_per_subject: 1,
+                max_bytes: 4 << 20,
+                allow_direct: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(nats_error)?;
             Ok::<_, Error>(client)
         })?;
 
@@ -265,6 +358,7 @@ impl NatsSink {
             runtime,
             client,
             publisher: Some(publisher),
+            history: History::default(),
         })
     }
 }
@@ -332,8 +426,17 @@ impl EventSink for NatsSink {
     }
 
     fn public(&mut self, message: &Public) -> Result<()> {
-        for message in public_messages(message)? {
-            self.queue.push(message);
+        self.history.add(message);
+        for m in public_messages(message)? {
+            self.queue.push(m);
+        }
+        // a fresh snapshot with every rollup, every 5 s
+        if let Public::Stats(rollup) = message {
+            self.queue.push(Message::new(
+                "shred.history",
+                Some(format!("history:{}", rollup.at_ns)),
+                self.history.json()?,
+            ));
         }
         Ok(())
     }
@@ -444,6 +547,77 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!((m[0].subject, m[0].id.is_none()), ("shred.public", true));
         assert!(m[0].payload.starts_with(br#"{"kind":"summary""#));
+    }
+
+    #[test]
+    fn test_history_keeps_the_latest() {
+        use crate::feed::SampleTx;
+        use crate::rollup::Fill;
+        let mut h = History::default();
+        // worst case sizes: real length leaders and signatures, every field set
+        for slot in 452_000_000..452_000_130u64 {
+            h.add(&Public::Summary(Summary {
+                slot,
+                leader: Some("5D1fNXzvv5NjV1ysLjirC4WY92RNsVH18vjmcszZd8on".to_string()),
+                first_shred_ns: 1_792_001_554_921_075_667,
+                done_ns: Some(1_792_001_555_183_199_732),
+                txs: 1_435,
+                data_missing: 12,
+                end: "complete",
+                fast_final: Some(true),
+                sample: vec![
+                    SampleTx {
+                        sig: format!("{slot}a{}", "x".repeat(78)),
+                        rebuilt: false,
+                    },
+                    SampleTx {
+                        sig: format!("{slot}b{}", "x".repeat(78)),
+                        rebuilt: true,
+                    },
+                ],
+            }));
+        }
+        for i in 0..130u64 {
+            h.add(&Public::Stats(Rollup {
+                at_ns: 1_792_001_554_921_075_667 + i,
+                window_s: 60,
+                packets_per_s: 4_040,
+                kernel_drops: Some(0),
+                slots_closed: 300,
+                slots_given_up: 2,
+                slots_never_came: 4,
+                data_shreds_missing_pct: 12.34,
+                set_fill_ms: Some(Fill {
+                    p50: 65.43,
+                    p99: 161.07,
+                }),
+                txs_rebuilt_pct: 42.81,
+                bad_proof: 0,
+                bad_signature: 0,
+                events_dropped: Some(0),
+                publish_lag_ms: Some(0.36),
+            }));
+        }
+        assert_eq!(
+            (h.slots.len(), h.stats.len()),
+            (HISTORY_SLOTS, HISTORY_STATS)
+        );
+        assert_eq!(h.slots.front().unwrap().slot, 452_000_010);
+        assert!(h.slots.iter().all(|s| s.sample.is_empty()));
+        // the newest samples first, in their slot's order
+        assert_eq!(h.samples.len(), HISTORY_SAMPLES);
+        assert!(
+            h.samples[0].sig.starts_with("452000129a")
+                && h.samples[1].sig.starts_with("452000129b")
+        );
+
+        let json = h.json().unwrap();
+        // max_payload on the node is 128 KB, keep a margin
+        assert!(json.len() < 112 * 1024, "{} bytes", json.len());
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["kind"], "history");
+        assert_eq!(v["slots"].as_array().unwrap().len(), HISTORY_SLOTS);
+        assert_eq!(v["samples"][0]["slot"], 452_000_129);
     }
 
     #[test]
@@ -614,6 +788,22 @@ mod tests {
         });
         assert_eq!(slots_stored, slots);
         assert!(!tx_stream);
+
+        // the snapshot a page opens with, read the way the page reads it, a direct get
+        let snapshot = sink.runtime.block_on(async {
+            let js = jetstream::new(reader.clone());
+            let stream = js.get_stream(HISTORY_STREAM).await.unwrap();
+            stream
+                .direct_get_last_for_subject("shred.history")
+                .await
+                .unwrap()
+                .payload
+        });
+        let v: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+        assert_eq!(v["kind"], "history");
+        // taken at the last rollup, so it holds the slots closed by then
+        assert!(!v["slots"].as_array().unwrap().is_empty());
+        assert!(!v["stats"].as_array().unwrap().is_empty());
         assert!(txs > 2_000 && slots > 40, "{txs} txs, {slots} slots");
         let received = |sub: &mut async_nats::Subscriber, want: u64| {
             sink.runtime.block_on(async {
