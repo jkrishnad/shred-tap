@@ -8,7 +8,7 @@ import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } f
 import { Separator } from "@/components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { Stats, Summary } from "@/lib/feed";
-import { STATS_KEPT, useFeed } from "@/lib/use-feed";
+import { type Feed, STATS_KEPT, useFeed } from "@/lib/use-feed";
 
 /** Provisional levels, to be set from a day of real rollups. */
 const LEVELS = { loss: { warn: 2, bad: 5 }, missingSlot: 4, readyP50: 150 };
@@ -67,21 +67,43 @@ function health(s: Stats): { state: State; label: string } {
 export default function Dashboard() {
   const feed = useFeed();
   const last = feed.stats[feed.stats.length - 1];
-  const nums = feed.maxSlot ? window120(feed.maxSlot) : [];
+
+  // hovering the slot panels, or space, holds them still so a slot can be read.
+  // The feed keeps coming underneath, and resuming jumps back to live.
+  const [hovering, setHovering] = useState(false);
+  const [held, setHeld] = useState(false);
+  const [frozen, setFrozen] = useState<Feed | null>(null);
+  const paused = hovering || held;
+  if (paused && !frozen) setFrozen(feed);
+  if (!paused && frozen) setFrozen(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== "Space" || e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      e.preventDefault();
+      setHeld((h) => !h);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  const hover = { onPointerEnter: () => setHovering(true), onPointerLeave: () => setHovering(false) };
+  const view = frozen ?? feed;
+  const waiting = frozen ? [...feed.slots.keys()].filter((slot) => slot > frozen.maxSlot).length : 0;
+
+  const nums = view.maxSlot ? window120(view.maxSlot) : [];
   // slots from before the page opened are left blank, not counted as missing,
   // and an empty bar after every leader window of 4 slots keeps the windows apart
   const strip = nums.flatMap((slot) => {
-    const cell = { key: String(slot), v: slot < feed.firstSlot ? 0 : 1, state: slotState(feed.slots.get(slot)) };
-    return slot % 4 === 3 && slot !== feed.maxSlot ? [cell, { key: `gap${slot}`, v: 0, state: "none" as State }] : [cell];
+    const cell = { key: String(slot), v: slot < view.firstSlot ? 0 : 1, state: slotState(view.slots.get(slot)) };
+    return slot % 4 === 3 && slot !== view.maxSlot ? [cell, { key: `gap${slot}`, v: 0, state: "none" as State }] : [cell];
   });
   const bars = nums.map((slot) => {
-    const s = feed.slots.get(slot);
+    const s = view.slots.get(slot);
     const state = slotState(s);
     // a slot that never completed is a full height red bar, the rest are capped at the top
     const missing = !s ? null : state === "bad" ? BAR_MAX : Math.min(s.data_missing, BAR_MAX);
     return { slot, missing, state, real: s?.data_missing ?? 0, total: s?.data_shreds ?? null };
   });
-  const rows = [...feed.slots.values()].sort((a, b) => b.slot - a.slot).slice(0, 14);
+  const rows = [...view.slots.values()].sort((a, b) => b.slot - a.slot).slice(0, 14);
   // each 5 s on its own, a gap where no set filled, no smoothing across it
   const series = feed.stats.map((s, i) => ({ i, p50: s.set_fill_ms_5s?.p50 ?? null, p99: s.set_fill_ms_5s?.p99 ?? null }));
   const readyTicks = roundTicks(Math.max(0, ...series.map((p) => p.p99 ?? 0)));
@@ -109,7 +131,7 @@ export default function Dashboard() {
         </div>
       </header>
 
-      <Card>
+      <Card {...hover}>
         <CardHeader>
           <CardTitle className={TITLE}>Last 120 slots</CardTitle>
           <CardDescription>grouped by leader window of 4 slots, newest on the right</CardDescription>
@@ -156,7 +178,7 @@ export default function Dashboard() {
       </div>
 
       <div className="grid gap-4 lg:grid-cols-5">
-        <Card className="lg:col-span-3">
+        <Card className="lg:col-span-3" {...hover}>
           <CardHeader>
             <CardTitle className={TITLE}>Missing data shreds per slot</CardTitle>
             <CardDescription>rebuilt from backup shreds, amber over 2% of the slot, red where it never completed</CardDescription>
@@ -209,7 +231,7 @@ export default function Dashboard() {
       </div>
 
       <div className="grid gap-4 lg:grid-cols-5">
-        <Card className="lg:col-span-3">
+        <Card className="lg:col-span-3" {...hover}>
           <CardHeader><CardTitle className={TITLE}>Recent slots</CardTitle></CardHeader>
           <CardContent>
             <Table>
@@ -294,6 +316,11 @@ export default function Dashboard() {
         leader sees it sooner. Warning levels are provisional until
         set from a day of real data.
       </p>
+      {paused && (
+        <Badge variant="outline" className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-background shadow-sm">
+          paused · {waiting} new slot{waiting === 1 ? "" : "s"} waiting{held ? " · space to resume" : ""}
+        </Badge>
+      )}
     </main>
   );
 }
