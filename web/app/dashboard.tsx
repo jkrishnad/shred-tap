@@ -88,7 +88,15 @@ export default function Dashboard() {
   }, []);
   const hover = (panel: Panel) => ({ onPointerEnter: () => setHovered(panel), onPointerLeave: () => setHovered(null) });
   const frozen = barsFrozen ?? tableFrozen ?? samplesFrozen;
-  const waiting = frozen ? [...feed.slots.keys()].filter((slot) => slot > frozen.maxSlot).length : 0;
+  // the samples panel counts the transactions that came after the pause, the others count slots
+  const newer = frozen ? [...feed.slots.values()].filter((s) => s.slot > frozen.maxSlot) : [];
+  let waiting = newer.length;
+  let unit = "slot";
+  if (samplesFrozen) {
+    waiting = 0;
+    for (const s of newer) waiting += s.sample.length;
+    unit = "tx";
+  }
   const view = barsFrozen ?? feed;
   const tableView = tableFrozen ?? feed;
   const samples = (samplesFrozen ?? feed).samples;
@@ -323,7 +331,7 @@ export default function Dashboard() {
       </p>
       {frozen && (
         <Badge variant="outline" className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-background shadow-sm">
-          paused · {waiting} new slot{waiting === 1 ? "" : "s"} waiting{held ? " · space to resume" : ""}
+          paused · {waiting} new {unit}{waiting === 1 ? "" : "s"} waiting{held ? " · space to resume" : ""}
         </Badge>
       )}
     </main>
