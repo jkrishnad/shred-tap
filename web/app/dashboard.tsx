@@ -1,7 +1,7 @@
 "use client";
 // The page: shadcn cards, badges, table and charts over the live feed.
 import { useEffect, useState } from "react";
-import { Area, AreaChart, Bar, BarChart, Cell, ReferenceLine, XAxis, YAxis } from "recharts";
+import { Area, AreaChart, Bar, BarChart, Cell, XAxis, YAxis } from "recharts";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
@@ -12,6 +12,10 @@ import { STATS_KEPT, useFeed } from "@/lib/use-feed";
 
 /** Provisional levels, to be set from a day of real rollups. */
 const LEVELS = { loss: { warn: 2, bad: 5 }, missingSlot: 4, readyP50: 150 };
+/** A slot is amber when more than this share of its data shreds was rebuilt (provisional). */
+const AMBER_SHARE = 0.02;
+/** The missing shreds chart is fixed to this, a taller bar is drawn capped at the top. */
+const BAR_MAX = 20;
 
 type State = "ok" | "warn" | "bad" | "none";
 
@@ -20,7 +24,7 @@ const TITLE = "text-[11px] font-normal uppercase tracking-wider text-muted-foreg
 
 const states = {
   ok: { label: "complete", color: "var(--chart-3)" },
-  warn: { label: "4+ data shreds rebuilt", color: "var(--chart-4)" },
+  warn: { label: "over 2% of data shreds rebuilt", color: "var(--chart-4)" },
   bad: { label: "never completed", color: "var(--chart-5)" },
   none: { label: "no shreds, skipped or ours", color: "#c9d1d6" },
 } satisfies ChartConfig;
@@ -38,6 +42,8 @@ const slotMs = (s: Summary) => (s.done_ns == null ? null : (s.done_ns - s.first_
 function slotState(s: Summary | undefined): State {
   if (!s) return "none";
   if (s.end !== "complete") return "bad";
+  // a share of the slot's own data shreds, so a big slot isn't amber just for being big
+  if (s.data_shreds) return s.data_missing / s.data_shreds > AMBER_SHARE ? "warn" : "ok";
   return s.data_missing >= LEVELS.missingSlot ? "warn" : "ok";
 }
 
@@ -67,10 +73,15 @@ export default function Dashboard() {
   });
   const bars = nums.map((slot) => {
     const s = feed.slots.get(slot);
-    return { slot, missing: s ? (s.end === "complete" ? s.data_missing : null) : null, state: slotState(s) };
+    const state = slotState(s);
+    // a slot that never completed is a full height red bar, the rest are capped at the top
+    const missing = !s ? null : state === "bad" ? BAR_MAX : Math.min(s.data_missing, BAR_MAX);
+    return { slot, missing, state, real: s?.data_missing ?? 0, total: s?.data_shreds ?? null };
   });
   const rows = [...feed.slots.values()].sort((a, b) => b.slot - a.slot).slice(0, 14);
-  const series = feed.stats.map((s, i) => ({ i, ...s, p50: s.set_fill_ms?.p50, p99: s.set_fill_ms?.p99 }));
+  // each 5 s on its own, a gap where no set filled, no smoothing across it
+  const series = feed.stats.map((s, i) => ({ i, p50: s.set_fill_ms_5s?.p50 ?? null, p99: s.set_fill_ms_5s?.p99 ?? null }));
+  const readyTicks = roundTicks(Math.max(0, ...series.map((p) => p.p99 ?? 0)));
   const h = feed.connection === "live" ? health(last) : "none";
 
   return (
@@ -99,7 +110,12 @@ export default function Dashboard() {
             <BarChart data={strip} barCategoryGap={1} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
               <Bar dataKey="v" isAnimationActive={false}>
                 {strip.map((d) => (
-                  <Cell key={d.key} fill={`var(--color-${d.state})`} fillOpacity={d.state === "ok" ? 0.55 : 1} />
+                  <Cell
+                    key={d.key}
+                    fill={d.state === "none" ? "transparent" : `var(--color-${d.state})`}
+                    stroke={d.state === "none" && d.v ? "var(--color-none)" : undefined}
+                    fillOpacity={d.state === "ok" ? 0.55 : 1}
+                  />
                 ))}
               </Bar>
             </BarChart>
@@ -124,22 +140,29 @@ export default function Dashboard() {
           note={`p99 ${fmt(last?.set_fill_ms?.p99)} ms`} state={(last?.set_fill_ms?.p50 ?? 0) > LEVELS.readyP50 ? "warn" : "ok"}
           values={feed.stats.flatMap((s) => (s.set_fill_ms ? [s.set_fill_ms.p50] : []))} />
         <Metric title="Transactions rebuilt" value={fmt(last?.txs_rebuilt_pct, 1)} unit="%"
-          note="held bytes that never arrived" state="ok" values={feed.stats.map((s) => s.txs_rebuilt_pct)} />
+          note="in a batch that needed backup shreds" state="ok" values={feed.stats.map((s) => s.txs_rebuilt_pct)} />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-5">
         <Card className="lg:col-span-3">
           <CardHeader>
             <CardTitle className={TITLE}>Missing data shreds per slot</CardTitle>
-            <CardDescription>rebuilt from backup shreds, red where the slot never completed</CardDescription>
+            <CardDescription>rebuilt from backup shreds, amber over 2% of the slot, red where it never completed</CardDescription>
           </CardHeader>
           <CardContent>
             <ChartContainer config={states} className="aspect-auto h-56 w-full">
               <BarChart data={bars} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
                 <XAxis dataKey="slot" tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={80} />
-                <YAxis allowDecimals={false} tickLine={false} axisLine={false} />
-                <ReferenceLine y={LEVELS.missingSlot} stroke="var(--color-warn)" strokeDasharray="3 3" />
-                <ChartTooltip content={<ChartTooltipContent hideIndicator labelFormatter={(_, p) => `slot ${p?.[0]?.payload?.slot}`} />} />
+                <YAxis domain={[0, BAR_MAX]} ticks={[0, 5, 10, 15, 20]} allowDataOverflow tickLine={false} axisLine={false} />
+                <ChartTooltip
+                  content={
+                    <ChartTooltipContent
+                      hideIndicator
+                      labelFormatter={(_, p) => `slot ${p?.[0]?.payload?.slot}`}
+                      formatter={(_, __, item) => missingText(item.payload)}
+                    />
+                  }
+                />
                 <Bar dataKey="missing" name="missing" isAnimationActive={false}>
                   {bars.map((d) => (
                     <Cell key={d.slot} fill={`var(--color-${d.state === "ok" ? "ok" : d.state})`} />
@@ -152,7 +175,7 @@ export default function Dashboard() {
         <Card className="lg:col-span-2">
           <CardHeader>
             <CardTitle className={TITLE}>Set ready time, last 10 min</CardTitle>
-            <CardDescription>first shred of a set to its 32nd, in ms</CardDescription>
+            <CardDescription>first shred of a set to its 32nd, in ms, each point 5 s of sets</CardDescription>
             {feed.stats.length < STATS_KEPT && (
               <CardAction className="font-mono text-xs text-muted-foreground">
                 collecting · {fmt((feed.stats.length * 5) / 60, 1)} of 10 min
@@ -161,12 +184,12 @@ export default function Dashboard() {
           </CardHeader>
           <CardContent>
             <ChartContainer config={lines} className="aspect-auto h-56 w-full">
-              <AreaChart data={series} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
+              <AreaChart data={series} margin={{ top: 8, right: 4, bottom: 8, left: -20 }}>
                 <XAxis dataKey="i" hide />
-                <YAxis tickLine={false} axisLine={false} />
+                <YAxis domain={[0, readyTicks[readyTicks.length - 1]]} ticks={readyTicks} interval={0} tickLine={false} axisLine={false} />
                 <ChartTooltip content={<ChartTooltipContent hideLabel />} />
-                <Area dataKey="p99" type="monotone" stroke="var(--color-p99)" fill="none" isAnimationActive={false} />
-                <Area dataKey="p50" type="monotone" stroke="var(--color-p50)" fill="var(--color-p50)" fillOpacity={0.15} isAnimationActive={false} />
+                <Area dataKey="p99" type="linear" stroke="var(--color-p99)" fill="none" isAnimationActive={false} />
+                <Area dataKey="p50" type="linear" stroke="var(--color-p50)" fill="var(--color-p50)" fillOpacity={0.15} isAnimationActive={false} />
               </AreaChart>
             </ChartContainer>
           </CardContent>
@@ -196,7 +219,7 @@ export default function Dashboard() {
                     <TableRow key={s.slot}>
                       <TableCell>{s.slot}</TableCell>
                       <TableCell>{short(s.leader)}</TableCell>
-                      <TableCell className="text-right">{s.txs ? fmt(s.txs) : "-"}</TableCell>
+                      <TableCell className="text-right">{s.end === "complete" ? fmt(s.txs) : "-"}</TableCell>
                       <TableCell className="text-right">{s.end === "complete" ? s.data_missing : "-"}</TableCell>
                       <TableCell className="text-right">{slotMs(s) == null ? "-" : `${fmt(slotMs(s))} ms`}</TableCell>
                       <TableCell className="text-right">{s.fast_final == null ? "-" : s.fast_final ? "fast" : "slow"}</TableCell>
@@ -253,8 +276,9 @@ export default function Dashboard() {
       <p className="text-xs text-muted-foreground">
         A set needs any 32 of its 64 shreds, so missing data shreds are rebuilt from backup shreds. A slot with no
         shreds was skipped by its leader, or was one of ours, which never reach us inbound. Stats cover the last minute
-        and refresh every 5 seconds, slots appear as they close, about 1.5 seconds after their first shred. Warning
-        levels are provisional until set from a day of real data.
+        and refresh every 5 seconds, slots appear as they close, about 1.5 seconds after their first shred. Some blocks
+        carry no transactions and show 0, a dash means the slot never completed. Warning levels are provisional until
+        set from a day of real data.
       </p>
     </main>
   );
@@ -275,12 +299,28 @@ function Metric(p: { title: string; value: string; unit: string; note: string; s
         <ChartContainer config={{ v: { color } }} className="aspect-auto h-11 w-full">
           <AreaChart data={p.values.map((v, i) => ({ i, v }))} margin={{ top: 2, right: 2, bottom: 2, left: 2 }}>
             <YAxis hide domain={["dataMin", "dataMax"]} />
-            <Area dataKey="v" type="monotone" stroke="var(--color-v)" fill="var(--color-v)" fillOpacity={0.15} isAnimationActive={false} />
+            <Area dataKey="v" type="linear" stroke="var(--color-v)" fill="var(--color-v)" fillOpacity={0.15} isAnimationActive={false} />
           </AreaChart>
         </ChartContainer>
       </CardContent>
     </Card>
   );
+}
+
+/** Round axis ticks from 0, in steps of 25, 50 or 100 ms. */
+function roundTicks(top: number) {
+  const step = top <= 100 ? 25 : top <= 200 ? 50 : 100;
+  const last = Math.max(step, Math.ceil(top / step) * step);
+  const ticks = [];
+  for (let t = 0; t <= last; t += step) ticks.push(t);
+  return ticks;
+}
+
+/** The bar chart's tooltip line: the real count, even above the chart's cap. */
+function missingText(d: { state: State; real: number; total: number | null }) {
+  if (d.state === "bad") return "never completed";
+  if (!d.total) return `missing ${d.real}`;
+  return `missing ${d.real} of ${d.total} (${fmt((d.real / d.total) * 100, 1)}%)`;
 }
 
 function Row({ k, v }: { k: string; v: string }) {

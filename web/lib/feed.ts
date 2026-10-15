@@ -14,6 +14,8 @@ export type Summary = {
   txs: number;
   /** data shreds that never arrived, rebuilt from backup shreds */
   data_missing: number;
+  /** all the slot's data shreds, 32 per FEC set, null when the slot never completed */
+  data_shreds?: number | null;
   end: "complete" | "given_up" | "end_of_input";
   /** whether the finalization in the footer took one round, null without one */
   fast_final: boolean | null;
@@ -31,9 +33,12 @@ export type Stats = {
   slots_never_came: number;
   data_shreds_missing_pct: number;
   set_fill_ms: { p50: number; p99: number } | null;
+  /** the same over only the last 5 s of sets, null percentiles when there were none */
+  set_fill_ms_5s?: { p50: number | null; p99: number | null; n: number };
   txs_rebuilt_pct: number;
   bad_proof: number;
   bad_signature: number;
+  stale_shreds?: number;
   events_dropped: number | null;
   publish_lag_ms: number | null;
 };

@@ -29,7 +29,7 @@ pub struct Rollup {
     pub window_s: u64,
     /// Packets a second since the rollup before.
     pub packets_per_s: u64,
-    /// Lost by the kernel since the capture opened, null from a file.
+    /// Lost by the kernel in the window, null from a file.
     pub kernel_drops: Option<u32>,
     pub slots_closed: u32,
     /// Closed slots that never completed, given up at their deadline.
@@ -40,12 +40,16 @@ pub struct Rollup {
     pub data_shreds_missing_pct: f64,
     /// First shred to 32nd over the sets in the window, null when there are none.
     pub set_fill_ms: Option<Fill>,
+    /// The same over only the sets since the rollup before, 5 s of them.
+    pub set_fill_ms_5s: FillN,
     /// Of the transactions in complete slots, the share holding bytes that never arrived.
     pub txs_rebuilt_pct: f64,
-    /// Since the start, shreds dropped by the Merkle and leader checks.
+    /// Shreds dropped by the Merkle and leader checks in the window.
     pub bad_proof: u64,
     pub bad_signature: u64,
-    /// Messages the publisher dropped or lost since the start, null when nothing publishes.
+    /// Shreds for slots long gone, dropped in the window.
+    pub stale_shreds: u64,
+    /// Messages the publisher dropped or lost in the window, null when nothing publishes.
     pub events_dropped: Option<u64>,
     /// Longest wait from queue to the server over the last 5 s, null when nothing went out.
     pub publish_lag_ms: Option<f64>,
@@ -56,6 +60,24 @@ pub struct Rollup {
 pub struct Fill {
     pub p50: f64,
     pub p99: f64,
+}
+
+/// Percentiles with how many sets they come from, null when there were none.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct FillN {
+    pub p50: Option<f64>,
+    pub p99: Option<f64>,
+    pub n: u32,
+}
+
+/// Counters that only ever grow, so the window's count is now minus a minute ago.
+#[derive(Debug, Default, Clone, Copy)]
+struct Totals {
+    bad_proof: u64,
+    bad_signature: u64,
+    stale: u64,
+    dropped: Option<u64>,
+    kernel: Option<u32>,
 }
 
 /// One closed slot, as the window keeps it.
@@ -82,6 +104,8 @@ pub struct Rollups {
     /// Packets and time at the rollup before, for the packet rate.
     last_packets: u64,
     last_at_ns: u64,
+    /// The counters at every rollup in the window, oldest first.
+    totals: VecDeque<(u64, Totals)>,
 }
 
 impl Rollups {
@@ -135,10 +159,11 @@ impl Rollups {
         published: impl FnOnce() -> Option<Published>,
     ) -> Option<Rollup> {
         let Some(mut next) = self.next_at_ns else {
-            // the first packet starts the clock
+            // the first packet starts the clock, and the counters from here on are counted
             self.next_at_ns = Some(now_ns.saturating_add(EVERY_NS));
             self.last_packets = stats.packets;
             self.last_at_ns = now_ns;
+            self.totals.push_back((now_ns, totals(stats, None, None)));
             return None;
         };
         if now_ns < next {
@@ -158,10 +183,32 @@ impl Rollups {
             self.fills.pop_front();
         }
 
+        // the sets since the rollup before, for the 5 s percentiles
+        let mut recent: Vec<u64> = self
+            .fills
+            .iter()
+            .filter(|(at, _)| *at >= self.last_at_ns)
+            .map(|(_, fill)| *fill)
+            .collect();
+        recent.sort_unstable();
+
         let elapsed = now_ns.saturating_sub(self.last_at_ns).max(1);
         let packets = stats.packets.saturating_sub(self.last_packets);
         self.last_packets = stats.packets;
         self.last_at_ns = now_ns;
+
+        // the window's counts: the counters now, minus the newest ones at or before a minute ago
+        let published = published();
+        let now = totals(
+            stats,
+            published.map(|p| p.dropped),
+            drops().map(|d| d.kernel),
+        );
+        self.totals.push_back((now_ns, now));
+        while self.totals.get(1).is_some_and(|(at, _)| *at <= since) {
+            self.totals.pop_front();
+        }
+        let before = self.totals.front().map(|(_, t)| *t).unwrap_or_default();
 
         let complete = || self.slots.iter().filter(|s| s.complete);
         let data_shreds = complete().map(|s| s.data_shreds).sum();
@@ -171,12 +218,13 @@ impl Rollups {
         let mut fills: Vec<u64> = self.fills.iter().map(|(_, fill)| *fill).collect();
         fills.sort_unstable();
 
-        let published = published();
         Some(Rollup {
             at_ns: now_ns,
             window_s: WINDOW_NS / 1_000_000_000,
             packets_per_s: (u128::from(packets) * 1_000_000_000 / u128::from(elapsed)) as u64,
-            kernel_drops: drops().map(|d| d.kernel),
+            kernel_drops: now
+                .kernel
+                .map(|k| k.saturating_sub(before.kernel.unwrap_or(0))),
             slots_closed: self.slots.len() as u32,
             slots_given_up: self.slots.iter().filter(|s| !s.complete).count() as u32,
             slots_never_came: self.never_came(),
@@ -185,10 +233,18 @@ impl Rollups {
                 p50: ms(rank(&fills, 50)),
                 p99: ms(rank(&fills, 99)),
             }),
+            set_fill_ms_5s: FillN {
+                p50: (!recent.is_empty()).then(|| ms(rank(&recent, 50))),
+                p99: (!recent.is_empty()).then(|| ms(rank(&recent, 99))),
+                n: recent.len() as u32,
+            },
             txs_rebuilt_pct: percent(txs_rebuilt, txs),
-            bad_proof: stats.bad_proof,
-            bad_signature: stats.bad_signature,
-            events_dropped: published.map(|p| p.dropped),
+            bad_proof: now.bad_proof - before.bad_proof,
+            bad_signature: now.bad_signature - before.bad_signature,
+            stale_shreds: now.stale - before.stale,
+            events_dropped: now
+                .dropped
+                .map(|d| d.saturating_sub(before.dropped.unwrap_or(0))),
             publish_lag_ms: published.and_then(|p| p.lag_ns).map(ms),
         })
     }
@@ -206,6 +262,16 @@ impl Rollups {
         seen.sort_unstable();
         seen.dedup();
         (span - seen.len() as u64) as u32
+    }
+}
+
+fn totals(stats: &Stats, dropped: Option<u64>, kernel: Option<u32>) -> Totals {
+    Totals {
+        bad_proof: stats.bad_proof,
+        bad_signature: stats.bad_signature,
+        stale: stats.stale,
+        dropped,
+        kernel,
     }
 }
 

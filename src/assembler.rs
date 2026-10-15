@@ -39,6 +39,9 @@ pub const DEFAULT_SLOT_NS: u64 = 200_000_000;
 
 /// Closed slots remembered so shreds arriving after them are counted, not reopened. About 14 minutes of slots.
 const CLOSED_SLOTS_KEPT: usize = 4096;
+/// A shred for a slot this far behind the newest one is stale, about a minute of slots.
+/// It is counted and dropped, so a straggler never opens a long gone slot again.
+pub const STALE_SLOTS: u64 = 300;
 
 /// When each part of a transaction's journey happened, all in capture nanoseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +177,8 @@ pub struct Stats {
     pub markers: u64,
     /// Footer markers whose bytes don't follow Agave's footer layout.
     pub bad_footers: u64,
+    /// Shreds for slots more than STALE_SLOTS behind the newest one, dropped.
+    pub stale: u64,
 }
 
 /// Which shreds of one FEC set have arrived, kept after the set is decoded and its slot closed.
@@ -218,6 +223,8 @@ pub struct Assembler {
     closed: BTreeMap<u64, BTreeMap<u32, Seen>>,
     /// Capture clock, the newest recv_ns seen, so a reordered packet can't move time backwards.
     now_ns: u64,
+    /// The newest slot that completed. Only a complete slot moves it, so a junk or straggler can't.
+    tip: u64,
     /// How long after its first shred a slot is given up on.
     give_up_ns: u64,
     /// Who led each slot. Without it signatures are not checked.
@@ -243,6 +250,7 @@ impl Assembler {
             slots: HashMap::new(),
             closed: BTreeMap::new(),
             now_ns: 0,
+            tip: 0,
             give_up_ns: DELTA_TIMEOUT_NS + LEADER_WINDOW_SLOTS * slot_ns + DELTA_NS,
             leaders: None,
             stats: Stats::default(),
@@ -283,6 +291,11 @@ impl Assembler {
         // the seen bits are checked first, so a copy is a duplicate however late it comes
         if let Some(sets) = self.closed.get_mut(&slot) {
             seen_late(sets, shred.fec_set_index, bit, &mut self.stats);
+            return events;
+        }
+
+        if slot.saturating_add(STALE_SLOTS) < self.tip {
+            self.stats.stale += 1;
             return events;
         }
 
@@ -490,6 +503,9 @@ impl Assembler {
             return Vec::new();
         };
         let end = state.ended.unwrap_or(end);
+        if end == SlotEnd::Complete {
+            self.tip = self.tip.max(slot);
+        }
         let seen = std::mem::take(&mut state.seen);
         let arrived = |index: u32| {
             let place = index % DATA_SHREDS as u32;

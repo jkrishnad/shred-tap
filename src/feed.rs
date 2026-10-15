@@ -10,7 +10,8 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::assembler::Event;
+use crate::assembler::{Event, SlotEnd};
+use crate::fec::DATA_SHREDS;
 use crate::record::base58;
 use crate::rollup::Rollup;
 
@@ -37,6 +38,8 @@ pub struct Summary {
     pub txs: u64,
     /// Data shreds that never arrived, so their bytes were rebuilt.
     pub data_missing: u64,
+    /// All the slot's data shreds, 32 per FEC set, null when the slot never completed.
+    pub data_shreds: Option<u64>,
     pub end: &'static str,
     /// Whether the finalization certificate in the footer took one round, null without one.
     pub fast_final: Option<bool>,
@@ -55,6 +58,7 @@ pub struct SampleTx {
 #[derive(Default)]
 struct Open {
     data_missing: u64,
+    data_shreds: u64,
     sample: Vec<SampleTx>,
 }
 
@@ -74,7 +78,9 @@ impl Feed {
                 decoded: true,
                 ..
             } => {
-                self.open.entry(*slot).or_default().data_missing += rebuilt.len() as u64;
+                let open = self.open.entry(*slot).or_default();
+                open.data_missing += rebuilt.len() as u64;
+                open.data_shreds += DATA_SHREDS as u64;
                 None
             }
             Event::Tx {
@@ -110,6 +116,7 @@ impl Feed {
                     done_ns: *done_ns,
                     txs: *txs,
                     data_missing: open.data_missing,
+                    data_shreds: (*end == SlotEnd::Complete).then_some(open.data_shreds),
                     end: end.as_str(),
                     fast_final: footer
                         .as_ref()
@@ -187,6 +194,8 @@ mod tests {
         }
         let s = feed.add(&slot(5, 5)).unwrap();
         assert_eq!((s.slot, s.txs, s.data_missing), (5, 5, 2));
+        // two decoded sets of 32
+        assert_eq!(s.data_shreds, Some(64));
         assert_eq!(s.done_ns, Some(1_261 * MS));
         assert_eq!(s.end, "complete");
         assert_eq!(s.leader.as_deref(), Some(base58([7; 32]).as_str()));

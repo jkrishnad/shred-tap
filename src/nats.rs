@@ -14,8 +14,8 @@
 //! if they are missing. shred.tx and shred.public are plain publishes, not stored, live only.
 //!
 //! So a page opens full instead of empty, NatsSink also keeps the last HISTORY_SLOTS summaries,
-//! HISTORY_STATS rollups and HISTORY_SAMPLES sampled transactions, and every time a rollup goes
-//! out it stores them as one snapshot on shred.history. That stream keeps only the latest message,
+//! HISTORY_STATS rollups and HISTORY_SAMPLES sampled transactions, and every HISTORY_EVERY
+//! it stores them as one snapshot on shred.history, so a page loses at most a few slots. That stream keeps only the latest message,
 //! on disk so a NATS restart keeps it, and a page reads it once with a JetStream direct get.
 //! The async client runs on its own small tokio runtime, so the rest of shredtap stays sync.
 
@@ -63,12 +63,14 @@ const STREAMS: [(&str, &str, Duration, i64); 2] = [
 
 /// The snapshot stream: only the latest message, readable with a direct get.
 const HISTORY_STREAM: &str = "SHRED_HISTORY";
-/// Slots in the snapshot, the page's slot strip.
-const HISTORY_SLOTS: usize = 120;
+/// Slots in the snapshot, more than the page's 120 slot window so it opens full.
+const HISTORY_SLOTS: usize = 150;
 /// Rollups in the snapshot, ten minutes of them.
 const HISTORY_STATS: usize = 120;
 /// Sampled transactions in the snapshot, the page's list.
 const HISTORY_SAMPLES: usize = 8;
+/// How often the snapshot is stored, so its newest slot is at most about 5 slots old.
+const HISTORY_EVERY: Duration = Duration::from_secs(1);
 
 /// What a page needs to open full.
 #[derive(Default)]
@@ -307,6 +309,8 @@ pub struct NatsSink {
     client: Client,
     publisher: Option<JoinHandle<()>>,
     history: History,
+    /// When the snapshot was last stored.
+    history_at: Option<Instant>,
 }
 
 impl NatsSink {
@@ -359,6 +363,7 @@ impl NatsSink {
             client,
             publisher: Some(publisher),
             history: History::default(),
+            history_at: None,
         })
     }
 }
@@ -430,11 +435,17 @@ impl EventSink for NatsSink {
         for m in public_messages(message)? {
             self.queue.push(m);
         }
-        // a fresh snapshot with every rollup, every 5 s
-        if let Public::Stats(rollup) = message {
+        // a fresh snapshot every HISTORY_EVERY, stored so a page can read it on connect
+        if self
+            .history_at
+            .is_none_or(|at| at.elapsed() >= HISTORY_EVERY)
+        {
+            let now = Instant::now();
+            self.history_at = Some(now);
+            let id = format!("history:{now:?}");
             self.queue.push(Message::new(
                 "shred.history",
-                Some(format!("history:{}", rollup.at_ns)),
+                Some(id),
                 self.history.json()?,
             ));
         }
@@ -539,6 +550,7 @@ mod tests {
             done_ns: None,
             txs: 0,
             data_missing: 0,
+            data_shreds: None,
             end: "given_up",
             fast_final: None,
             sample: Vec::new(),
@@ -552,10 +564,10 @@ mod tests {
     #[test]
     fn test_history_keeps_the_latest() {
         use crate::feed::SampleTx;
-        use crate::rollup::Fill;
+        use crate::rollup::{Fill, FillN};
         let mut h = History::default();
         // worst case sizes: real length leaders and signatures, every field set
-        for slot in 452_000_000..452_000_130u64 {
+        for slot in 452_000_000..452_000_160u64 {
             h.add(&Public::Summary(Summary {
                 slot,
                 leader: Some("5D1fNXzvv5NjV1ysLjirC4WY92RNsVH18vjmcszZd8on".to_string()),
@@ -563,6 +575,7 @@ mod tests {
                 done_ns: Some(1_792_001_555_183_199_732),
                 txs: 1_435,
                 data_missing: 12,
+                data_shreds: Some(2_240),
                 end: "complete",
                 fast_final: Some(true),
                 sample: vec![
@@ -591,6 +604,12 @@ mod tests {
                     p50: 65.43,
                     p99: 161.07,
                 }),
+                set_fill_ms_5s: FillN {
+                    p50: Some(65.43),
+                    p99: Some(161.07),
+                    n: 812,
+                },
+                stale_shreds: 1_234,
                 txs_rebuilt_pct: 42.81,
                 bad_proof: 0,
                 bad_signature: 0,
@@ -603,12 +622,13 @@ mod tests {
             (HISTORY_SLOTS, HISTORY_STATS)
         );
         assert_eq!(h.slots.front().unwrap().slot, 452_000_010);
+        assert_eq!(h.slots.back().unwrap().slot, 452_000_159);
         assert!(h.slots.iter().all(|s| s.sample.is_empty()));
         // the newest samples first, in their slot's order
         assert_eq!(h.samples.len(), HISTORY_SAMPLES);
         assert!(
-            h.samples[0].sig.starts_with("452000129a")
-                && h.samples[1].sig.starts_with("452000129b")
+            h.samples[0].sig.starts_with("452000159a")
+                && h.samples[1].sig.starts_with("452000159b")
         );
 
         let json = h.json().unwrap();
@@ -617,7 +637,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["kind"], "history");
         assert_eq!(v["slots"].as_array().unwrap().len(), HISTORY_SLOTS);
-        assert_eq!(v["samples"][0]["slot"], 452_000_129);
+        assert_eq!(v["samples"][0]["slot"], 452_000_159);
     }
 
     #[test]
