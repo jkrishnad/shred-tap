@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 
-use crate::assembler::{Event, SlotEnd, Stats};
+use crate::assembler::{Event, STALE_SLOTS, SlotEnd, Stats};
 use crate::fec::DATA_SHREDS;
 use crate::pcap::Drops;
 use crate::record::Published;
@@ -42,6 +42,9 @@ pub struct Rollup {
     pub set_fill_ms: Option<Fill>,
     /// The same over only the sets since the rollup before, 5 s of them.
     pub set_fill_ms_5s: FillN,
+    /// A slot's first shred to its first decoded transaction, over complete slots in the window.
+    /// Measured from the first shred this node received, not from when the leader started.
+    pub first_tx_ms: Option<Fill>,
     /// Of the transactions in complete slots, the share holding bytes that never arrived.
     pub txs_rebuilt_pct: f64,
     /// Shreds dropped by the Merkle and leader checks in the window.
@@ -90,6 +93,9 @@ struct SlotSample {
     data_missing: u64,
     txs: u64,
     txs_rebuilt: u64,
+    /// When its first transaction decoded, then how long after its first shred that was.
+    first_tx_ns: Option<u64>,
+    first_tx: Option<u64>,
 }
 
 /// Collects events and makes a Rollup every EVERY_NS.
@@ -128,10 +134,17 @@ impl Rollups {
                         .push_back((*first_shred_ns, t1.saturating_sub(*first_shred_ns)));
                 }
             }
-            Event::Tx { slot, rebuilt, .. } => {
+            Event::Tx {
+                slot,
+                rebuilt,
+                timing,
+                ..
+            } => {
                 let s = self.open.entry(*slot).or_default();
                 s.txs += 1;
                 s.txs_rebuilt += u64::from(*rebuilt);
+                let decoded = timing.decoded_ns;
+                s.first_tx_ns = Some(s.first_tx_ns.map_or(decoded, |t| t.min(decoded)));
             }
             Event::Slot {
                 slot,
@@ -143,6 +156,7 @@ impl Rollups {
                 s.slot = *slot;
                 s.at_ns = *first_shred_ns;
                 s.complete = *end == SlotEnd::Complete;
+                s.first_tx = s.first_tx_ns.map(|t| t.saturating_sub(*first_shred_ns));
                 self.slots.push_back(s);
             }
             _ => {}
@@ -210,7 +224,16 @@ impl Rollups {
         }
         let before = self.totals.front().map(|(_, t)| *t).unwrap_or_default();
 
-        let complete = || self.slots.iter().filter(|s| s.complete);
+        // only slots near the newest one count, so a straggler from long ago can't skew the window
+        let newest = self.slots.iter().map(|s| s.slot).max().unwrap_or(0);
+        let fresh: Vec<&SlotSample> = self
+            .slots
+            .iter()
+            .filter(|s| s.slot.saturating_add(STALE_SLOTS) >= newest)
+            .collect();
+        let complete = || fresh.iter().filter(|s| s.complete);
+        let mut first_tx: Vec<u64> = complete().filter_map(|s| s.first_tx).collect();
+        first_tx.sort_unstable();
         let data_shreds = complete().map(|s| s.data_shreds).sum();
         let data_missing = complete().map(|s| s.data_missing).sum();
         let txs = complete().map(|s| s.txs).sum();
@@ -225,9 +248,9 @@ impl Rollups {
             kernel_drops: now
                 .kernel
                 .map(|k| k.saturating_sub(before.kernel.unwrap_or(0))),
-            slots_closed: self.slots.len() as u32,
-            slots_given_up: self.slots.iter().filter(|s| !s.complete).count() as u32,
-            slots_never_came: self.never_came(),
+            slots_closed: fresh.len() as u32,
+            slots_given_up: fresh.iter().filter(|s| !s.complete).count() as u32,
+            slots_never_came: never_came(&fresh),
             data_shreds_missing_pct: percent(data_missing, data_shreds),
             set_fill_ms: (!fills.is_empty()).then(|| Fill {
                 p50: ms(rank(&fills, 50)),
@@ -238,6 +261,10 @@ impl Rollups {
                 p99: (!recent.is_empty()).then(|| ms(rank(&recent, 99))),
                 n: recent.len() as u32,
             },
+            first_tx_ms: (!first_tx.is_empty()).then(|| Fill {
+                p50: ms(rank(&first_tx, 50)),
+                p99: ms(rank(&first_tx, 99)),
+            }),
             txs_rebuilt_pct: percent(txs_rebuilt, txs),
             bad_proof: now.bad_proof - before.bad_proof,
             bad_signature: now.bad_signature - before.bad_signature,
@@ -248,21 +275,21 @@ impl Rollups {
             publish_lag_ms: published.and_then(|p| p.lag_ns).map(ms),
         })
     }
+}
 
-    /// Slot numbers between the lowest and the highest closed slot in the window that never closed.
-    fn never_came(&self) -> u32 {
-        let (Some(low), Some(high)) = (
-            self.slots.iter().map(|s| s.slot).min(),
-            self.slots.iter().map(|s| s.slot).max(),
-        ) else {
-            return 0;
-        };
-        let span = high - low + 1;
-        let mut seen: Vec<u64> = self.slots.iter().map(|s| s.slot).collect();
-        seen.sort_unstable();
-        seen.dedup();
-        (span - seen.len() as u64) as u32
-    }
+/// Slot numbers between the lowest and the highest closed slot that never closed.
+fn never_came(slots: &[&SlotSample]) -> u32 {
+    let (Some(low), Some(high)) = (
+        slots.iter().map(|s| s.slot).min(),
+        slots.iter().map(|s| s.slot).max(),
+    ) else {
+        return 0;
+    };
+    let span = high - low + 1;
+    let mut seen: Vec<u64> = slots.iter().map(|s| s.slot).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    (span - seen.len() as u64) as u32
 }
 
 fn totals(stats: &Stats, dropped: Option<u64>, kernel: Option<u32>) -> Totals {

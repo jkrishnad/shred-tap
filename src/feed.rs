@@ -40,6 +40,9 @@ pub struct Summary {
     pub data_missing: u64,
     /// All the slot's data shreds, 32 per FEC set, null when the slot never completed.
     pub data_shreds: Option<u64>,
+    /// The slot's first shred to its first decoded transaction, from this node's view,
+    /// null when nothing decoded.
+    pub first_tx_ms: Option<f64>,
     pub end: &'static str,
     /// Whether the finalization certificate in the footer took one round, null without one.
     pub fast_final: Option<bool>,
@@ -59,6 +62,7 @@ pub struct SampleTx {
 struct Open {
     data_missing: u64,
     data_shreds: u64,
+    first_tx_ns: Option<u64>,
     sample: Vec<SampleTx>,
 }
 
@@ -87,9 +91,12 @@ impl Feed {
                 slot,
                 signature,
                 rebuilt,
+                timing,
                 ..
             } => {
                 let open = self.open.entry(*slot).or_default();
+                let decoded = timing.decoded_ns;
+                open.first_tx_ns = Some(open.first_tx_ns.map_or(decoded, |t| t.min(decoded)));
                 if open.sample.len() < SAMPLE_TXS {
                     open.sample.push(SampleTx {
                         sig: signature.to_string(),
@@ -117,6 +124,9 @@ impl Feed {
                     txs: *txs,
                     data_missing: open.data_missing,
                     data_shreds: (*end == SlotEnd::Complete).then_some(open.data_shreds),
+                    first_tx_ms: open.first_tx_ns.map(|t| {
+                        (t.saturating_sub(*first_shred_ns) as f64 / 10_000.0).round() / 100.0
+                    }),
                     end: end.as_str(),
                     fast_final: footer
                         .as_ref()

@@ -551,6 +551,7 @@ mod tests {
             txs: 0,
             data_missing: 0,
             data_shreds: None,
+            first_tx_ms: None,
             end: "given_up",
             fast_final: None,
             sample: Vec::new(),
@@ -576,6 +577,7 @@ mod tests {
                 txs: 1_435,
                 data_missing: 12,
                 data_shreds: Some(2_240),
+                first_tx_ms: Some(42.17),
                 end: "complete",
                 fast_final: Some(true),
                 sample: vec![
@@ -610,6 +612,10 @@ mod tests {
                     n: 812,
                 },
                 stale_shreds: 1_234,
+                first_tx_ms: Some(Fill {
+                    p50: 42.17,
+                    p99: 118.4,
+                }),
                 txs_rebuilt_pct: 42.81,
                 bad_proof: 0,
                 bad_signature: 0,

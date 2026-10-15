@@ -16,6 +16,8 @@ export type Summary = {
   data_missing: number;
   /** all the slot's data shreds, 32 per FEC set, null when the slot never completed */
   data_shreds?: number | null;
+  /** the slot's first shred to its first decoded transaction, from this node's view */
+  first_tx_ms?: number | null;
   end: "complete" | "given_up" | "end_of_input";
   /** whether the finalization in the footer took one round, null without one */
   fast_final: boolean | null;
@@ -35,6 +37,8 @@ export type Stats = {
   set_fill_ms: { p50: number; p99: number } | null;
   /** the same over only the last 5 s of sets, null percentiles when there were none */
   set_fill_ms_5s?: { p50: number | null; p99: number | null; n: number };
+  /** first shred to first decoded transaction, over complete slots in the window */
+  first_tx_ms?: { p50: number; p99: number } | null;
   txs_rebuilt_pct: number;
   bad_proof: number;
   bad_signature: number;

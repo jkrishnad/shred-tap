@@ -53,12 +53,15 @@ function window120(maxSlot: number) {
   return Array.from({ length: 120 }, (_, i) => first + i).filter((s) => s <= maxSlot);
 }
 
-function health(s: Stats | undefined): State {
-  if (!s) return "none";
+/** The header pill. Loss is upstream, so it names the network's state, not our node's.
+ *  Only drops and invalid shreds are about this side. */
+function health(s: Stats): { state: State; label: string } {
   const loss = s.data_shreds_missing_pct;
-  if (s.bad_proof > 0 || s.bad_signature > 0 || loss > LEVELS.loss.bad) return "bad";
-  if (loss > LEVELS.loss.warn || (s.kernel_drops ?? 0) > 0 || (s.events_dropped ?? 0) > 0) return "warn";
-  return "ok";
+  if (s.bad_proof > 0 || s.bad_signature > 0) return { state: "bad", label: "invalid shreds" };
+  if ((s.kernel_drops ?? 0) > 0 || (s.events_dropped ?? 0) > 0) return { state: "bad", label: "capture issue" };
+  if (loss > LEVELS.loss.bad) return { state: "bad", label: `network overloaded · ${fmt(loss, 1)}% loss` };
+  if (loss > LEVELS.loss.warn) return { state: "warn", label: `network busy · ${fmt(loss, 1)}% loss` };
+  return { state: "ok", label: "healthy" };
 }
 
 export default function Dashboard() {
@@ -82,7 +85,13 @@ export default function Dashboard() {
   // each 5 s on its own, a gap where no set filled, no smoothing across it
   const series = feed.stats.map((s, i) => ({ i, p50: s.set_fill_ms_5s?.p50 ?? null, p99: s.set_fill_ms_5s?.p99 ?? null }));
   const readyTicks = roundTicks(Math.max(0, ...series.map((p) => p.p99 ?? 0)));
-  const h = feed.connection === "live" ? health(last) : "none";
+  const pill =
+    feed.connection !== "live"
+      ? { state: "none" as State, label: feed.connection }
+      : !last
+        ? { state: "none" as State, label: "waiting for stats" }
+        : health(last);
+  const h = pill.state;
 
   return (
     <main className="mx-auto grid max-w-7xl gap-4 px-4 py-5">
@@ -90,7 +99,7 @@ export default function Dashboard() {
         <h1 className="text-lg font-semibold">shreds</h1>
         <span className="text-sm text-muted-foreground">Vyra Labs testnet validator · Singapore · UDP 8001</span>
         <Badge variant={h === "bad" ? "destructive" : "outline"} style={h !== "none" ? { color: states[h].color } : undefined}>
-          {feed.connection !== "live" ? feed.connection : !last ? "waiting for stats" : h === "ok" ? "healthy" : h === "warn" ? "degraded" : "unhealthy"}
+          {pill.label}
         </Badge>
         <div className="flex-1" />
         <div className="flex gap-4 text-xs text-muted-foreground">
@@ -128,7 +137,7 @@ export default function Dashboard() {
         </CardContent>
       </Card>
 
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
         <Metric title="Packets in" value={fmt(last?.packets_per_s)} unit="pkt/s"
           note={`kernel drops ${fmt(last?.kernel_drops)}`} state={(last?.kernel_drops ?? 0) > 0 ? "warn" : "ok"}
           values={feed.stats.map((s) => s.packets_per_s)} />
@@ -139,6 +148,9 @@ export default function Dashboard() {
         <Metric title="Set ready p50" value={fmt(last?.set_fill_ms?.p50)} unit="ms"
           note={`p99 ${fmt(last?.set_fill_ms?.p99)} ms`} state={(last?.set_fill_ms?.p50 ?? 0) > LEVELS.readyP50 ? "warn" : "ok"}
           values={feed.stats.flatMap((s) => (s.set_fill_ms ? [s.set_fill_ms.p50] : []))} />
+        <Metric title="First tx readable" value={fmt(last?.first_tx_ms?.p50)} unit="ms"
+          note={`p99 ${fmt(last?.first_tx_ms?.p99)} ms after the block's first shred`} state="ok"
+          values={feed.stats.flatMap((s) => (s.first_tx_ms ? [s.first_tx_ms.p50] : []))} />
         <Metric title="Transactions rebuilt" value={fmt(last?.txs_rebuilt_pct, 1)} unit="%"
           note="in a batch that needed backup shreds" state="ok" values={feed.stats.map((s) => s.txs_rebuilt_pct)} />
       </div>
@@ -277,7 +289,9 @@ export default function Dashboard() {
         A set needs any 32 of its 64 shreds, so missing data shreds are rebuilt from backup shreds. A slot with no
         shreds was skipped by its leader, or was one of ours, which never reach us inbound. Stats cover the last minute
         and refresh every 5 seconds, slots appear as they close, about 1.5 seconds after their first shred. Some blocks
-        carry no transactions and show 0, a dash means the slot never completed. Warning levels are provisional until
+        carry no transactions and show 0, a dash means the slot never completed. First tx readable counts from the
+        first shred this node received for the block, not from when the leader started, so a node closer to the
+        leader sees it sooner. Warning levels are provisional until
         set from a day of real data.
       </p>
     </main>
