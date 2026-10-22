@@ -15,7 +15,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::assembler::{Event, Stats, Timing};
+use shred_core::assembler::{Event, Stats, Timing};
 use crate::error::Result;
 use crate::feed::Public;
 use shred_core::footer::{FinalCert, Footer, RewardCert, Signers};
@@ -376,7 +376,7 @@ fn write_line(w: &mut impl Write, record: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembler::{Event, SlotEnd, Stats, Timing};
+    use shred_core::assembler::{Event, SlotEnd, Stats, Timing};
     use solana_transaction::Signature;
     use std::str::FromStr;
 

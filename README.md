@@ -30,7 +30,7 @@ cd shred-tap
 cargo build --release
 ```
 
-Cargo fetches shred-core from GitHub at tag `v0.1.0`. That builds `shredtap decode`. Two features add the live parts.
+Cargo fetches shred-core from GitHub at tag `v0.2.0`. That builds `shredtap decode`. Two features add the live parts.
 
 - `live` adds `shredtap live`, reading packets straight from a network interface. Needs libpcap.
 - `nats` adds `--nats`, publishing every event to a NATS server.

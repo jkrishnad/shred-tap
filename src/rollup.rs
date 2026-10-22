@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 
-use crate::assembler::{Event, STALE_SLOTS, SlotEnd, Stats};
+use shred_core::assembler::{Event, STALE_SLOTS, SlotEnd, Stats};
 use shred_core::fec::DATA_SHREDS;
 use shred_core::pcap::Drops;
 use crate::record::Published;
@@ -323,7 +323,7 @@ fn ms(ns: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembler::Timing;
+    use shred_core::assembler::Timing;
     use solana_transaction::Signature;
 
     const S: u64 = 1_000_000_000;

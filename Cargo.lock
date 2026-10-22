@@ -1230,8 +1230,8 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shred-core"
-version = "0.1.0"
-source = "git+https://github.com/vyralabshq/shred-core?tag=v0.1.0#044dbb8a27f22cf5a5895c31ee40297a1e84ae34"
+version = "0.2.0"
+source = "git+https://github.com/vyralabshq/shred-core?tag=v0.2.0#5d5d7c3c6cb051c770ce99dcdd35d64725090096"
 dependencies = [
  "reed-solomon-erasure",
  "serde",

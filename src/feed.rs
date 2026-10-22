@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::assembler::{Event, SlotEnd};
+use shred_core::assembler::{Event, SlotEnd};
 use shred_core::fec::DATA_SHREDS;
 use crate::record::base58;
 use crate::rollup::Rollup;
@@ -143,7 +143,7 @@ impl Feed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembler::{Assembler, SlotEnd, Timing};
+    use shred_core::assembler::{Assembler, SlotEnd, Timing};
     use solana_transaction::Signature;
     use std::str::FromStr;
 

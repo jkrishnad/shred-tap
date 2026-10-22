@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use shredtap::assembler::{Assembler, DEFAULT_SLOT_NS, Stats};
+use shred_core::assembler::{Assembler, DEFAULT_SLOT_NS, Stats};
 use shredtap::feed::{Feed, Public};
 use shred_core::leaders::{LeaderDir, LeaderSchedule};
 use shred_core::pcap::{PacketSource, PcapReader, udp_payload};

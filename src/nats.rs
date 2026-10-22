@@ -30,7 +30,7 @@ use async_nats::jetstream::{self, stream};
 use async_nats::{Client, HeaderMap, header};
 use tokio::runtime::Runtime;
 
-use crate::assembler::Event;
+use shred_core::assembler::Event;
 use crate::error::{Error, Result};
 use crate::feed::{Public, Summary};
 use crate::record::{EventSink, Published, untagged_json};
@@ -478,7 +478,7 @@ impl Drop for NatsSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembler::{SlotEnd, Timing};
+    use shred_core::assembler::{SlotEnd, Timing};
     use crate::feed::Summary;
     use solana_transaction::Signature;
 
@@ -743,7 +743,7 @@ mod tests {
 
     #[test]
     fn test_publish_a_real_capture() {
-        use crate::assembler::Assembler;
+        use shred_core::assembler::Assembler;
         use crate::feed::Feed;
         use shred_core::pcap::{PacketSource, PcapReader, udp_payload};
         use crate::rollup::Rollups;
