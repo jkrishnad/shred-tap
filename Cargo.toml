@@ -8,17 +8,13 @@ anyhow = "1.0.104"
 async-nats = { version = "0.50.0", default-features = false, features = ["jetstream", "ring"], optional = true }
 clap = { version = "4.6.7", features = ["derive"] }
 pcap = { version = "2.5.0", optional = true }
-reed-solomon-erasure = "6.0.0"
 serde = { version = "1.0.229", features = ["serde_derive"] }
 serde_json = "1.0.151"
-sha2 = "0.10.9"
-solana-address = { version = "2.9.0", default-features = false, features = ["decode"] }
+shred-core = { git = "https://github.com/vyralabshq/shred-core", tag = "v0.1.0" }
 solana-hash = { version = "4.7.0", features = ["wincode"] }
-solana-signature = { version = "3.6.0", features = ["verify"] }
 solana-transaction = { version = "5.1.0", features = ["wincode"] }
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", default-features = false, features = ["rt-multi-thread", "net", "time"], optional = true }
-wincode = "0.6.2"
 
 [features]
 # shredtap live, reading packets straight from a network interface, needs libpcap to build
@@ -28,3 +24,4 @@ nats = ["dep:async-nats", "dep:tokio"]
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false }
+

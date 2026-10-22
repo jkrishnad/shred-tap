@@ -18,7 +18,7 @@ use serde::Serialize;
 use crate::assembler::{Event, Stats, Timing};
 use crate::error::Result;
 use crate::feed::Public;
-use crate::footer::{FinalCert, Footer, RewardCert, Signers};
+use shred_core::footer::{FinalCert, Footer, RewardCert, Signers};
 use solana_hash::Hash;
 
 /// One line of tx.jsonl, keyed by the transaction's first signature.

@@ -18,8 +18,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use shredtap::assembler::{Assembler, DEFAULT_SLOT_NS, Stats};
 use shredtap::feed::{Feed, Public};
-use shredtap::leaders::{LeaderDir, LeaderSchedule};
-use shredtap::pcap::{PacketSource, PcapReader, udp_payload};
+use shred_core::leaders::{LeaderDir, LeaderSchedule};
+use shred_core::pcap::{PacketSource, PcapReader, udp_payload};
 use shredtap::record::{EventSink, LineSink, Output, write_summary};
 use shredtap::rollup::Rollups;
 

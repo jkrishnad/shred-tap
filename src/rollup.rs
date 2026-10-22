@@ -12,8 +12,8 @@ use std::collections::{HashMap, VecDeque};
 use serde::Serialize;
 
 use crate::assembler::{Event, STALE_SLOTS, SlotEnd, Stats};
-use crate::fec::DATA_SHREDS;
-use crate::pcap::Drops;
+use shred_core::fec::DATA_SHREDS;
+use shred_core::pcap::Drops;
 use crate::record::Published;
 
 /// How far back a rollup looks.

@@ -745,7 +745,7 @@ mod tests {
     fn test_publish_a_real_capture() {
         use crate::assembler::Assembler;
         use crate::feed::Feed;
-        use crate::pcap::{PacketSource, PcapReader, udp_payload};
+        use shred_core::pcap::{PacketSource, PcapReader, udp_payload};
         use crate::rollup::Rollups;
         use futures_util::StreamExt;
 

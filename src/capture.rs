@@ -6,8 +6,8 @@
 //! the file reader gives, so the decoder can't tell a live interface from a capture file.
 //! Opening an interface needs root or the cap_net_raw and cap_net_admin capabilities.
 
-use crate::error::{Error, Result};
-use crate::pcap::{Drops, PacketSource, Record};
+use shred_core::error::{Error, Result};
+use shred_core::pcap::{Drops, PacketSource, Record};
 use pcap::{Active, Capture, Direction, Precision};
 
 /// UDP length field is the 8 byte header plus the payload, 1211 for a data shred, 1236 for coding.
@@ -27,15 +27,17 @@ pub struct LiveCapture {
 impl LiveCapture {
     /// Opens the interface and starts capturing shreds.
     pub fn open(interface: &str) -> Result<Self> {
-        let mut cap = Capture::from_device(interface)?
+        let mut cap = Capture::from_device(interface)
+            .map_err(capture_error)?
             .snaplen(SNAPLEN)
             .buffer_size(BUFFER_BYTES)
             .immediate_mode(true)
             .precision(Precision::Nano)
             .timeout(READ_TIMEOUT_MS)
-            .open()?;
-        cap.direction(Direction::In)?;
-        cap.filter(SHRED_FILTER, true)?;
+            .open()
+            .map_err(capture_error)?;
+        cap.direction(Direction::In).map_err(capture_error)?;
+        cap.filter(SHRED_FILTER, true).map_err(capture_error)?;
         Ok(Self { cap })
     }
 }
@@ -58,7 +60,7 @@ impl PacketSource for LiveCapture {
                     }));
                 }
                 Err(pcap::Error::TimeoutExpired) => continue,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(capture_error(e)),
             }
         }
     }
@@ -81,6 +83,11 @@ fn recv_ns(sec: i64, nsec: i64) -> Result<u64> {
     sec.checked_mul(1_000_000_000)
         .and_then(|ns| ns.checked_add(nsec))
         .ok_or_else(bad)
+}
+
+/// A libpcap error, as the Capture error every packet source returns.
+fn capture_error(e: pcap::Error) -> Error {
+    Error::Capture(e.to_string())
 }
 
 #[cfg(test)]

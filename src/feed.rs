@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::assembler::{Event, SlotEnd};
-use crate::fec::DATA_SHREDS;
+use shred_core::fec::DATA_SHREDS;
 use crate::record::base58;
 use crate::rollup::Rollup;
 
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn test_real_capture_fits_the_budget() {
         // the public feed of the 10 s capture, about 2 KB a second
-        use crate::pcap::{PacketSource, PcapReader, udp_payload};
+        use shred_core::pcap::{PacketSource, PcapReader, udp_payload};
         use crate::rollup::Rollups;
         let Ok(file) = std::fs::File::open("tests/fixtures/real-10s.pcap") else {
             return;

@@ -10,14 +10,14 @@
 //! so they can say which data shreds never arrived and only exist because Reed-Solomon rebuilt them.
 //! Every event carries t0 (first shred of the set), t1 (32nd shred) and t2 (the batch could decode).
 
-use crate::block::{Batcher, Component, decode_component, is_last_in_slot};
-use crate::error::Error;
-use crate::fec::{DATA_SHREDS, FecSet, TOTAL_SHREDS};
-use crate::footer::{Footer, decode_footer};
-use crate::leaders::{LeaderSchedule, Pubkey, signed_by};
-use crate::merkle::shred_root;
-use crate::shred::{Kind, Shred};
-use crate::wire;
+use shred_core::block::{Batcher, Component, decode_component, is_last_in_slot};
+use shred_core::error::Error;
+use shred_core::fec::{DATA_SHREDS, FecSet, TOTAL_SHREDS};
+use shred_core::footer::{Footer, decode_footer};
+use shred_core::leaders::{LeaderSchedule, Pubkey, signed_by};
+use shred_core::merkle::shred_root;
+use shred_core::shred::{Kind, Shred};
+use shred_core::wire;
 use solana_transaction::Signature;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
@@ -1336,7 +1336,7 @@ mod tests {
 
     #[test]
     fn test_real_capture() {
-        use crate::pcap::{PacketSource, PcapReader, udp_payload};
+        use shred_core::pcap::{PacketSource, PcapReader, udp_payload};
         let Ok(file) = std::fs::File::open("tests/fixtures/real-10s.pcap") else {
             return;
         };
@@ -1360,7 +1360,7 @@ mod tests {
                 ..
             } = e
             {
-                let footer = crate::footer::decode_footer(data).unwrap();
+                let footer = shred_core::footer::decode_footer(data).unwrap();
                 assert_eq!(footer.final_cert.unwrap().slot, slot - 1);
                 footers += 1;
             }
