@@ -6,6 +6,8 @@ shredtap reads the shreds arriving at a node, from a packet capture or live from
 
 Live from the Vyra Labs testnet validator in Singapore: [shreds.vyralabs.fun](https://shreds.vyralabs.fun)
 
+The shred reading itself lives in [shred-core](https://github.com/vyralabshq/shred-core): parsing shreds, Merkle proofs and leader signatures, FEC sets and Reed-Solomon, and decoding entries and the block footer. shredtap runs it on a capture or a live interface, times every step and publishes what it finds.
+
 ![shredtap architecture](docs/architecture.png)
 
 ## What it checks
@@ -28,7 +30,7 @@ cd shred-tap
 cargo build --release
 ```
 
-That builds `shredtap decode`. Two features add the live parts.
+Cargo fetches shred-core from GitHub at tag `v0.1.0`. That builds `shredtap decode`. Two features add the live parts.
 
 - `live` adds `shredtap live`, reading packets straight from a network interface. Needs libpcap.
 - `nats` adds `--nats`, publishing every event to a NATS server.
