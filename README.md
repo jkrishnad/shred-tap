@@ -4,7 +4,7 @@ Watch the shreds that reach your Solana validator and rebuild the blocks from th
 
 shredtap reads the shreds arriving at a node, from a packet capture or live from the network interface. It puts the FEC sets back together, rebuilds missing pieces with Reed-Solomon and decodes every transaction, with the nanosecond time its shreds arrived. It only reads. It never sends anything to the cluster and never touches the validator.
 
-Live from the Vyra Labs testnet validator in Singapore: [shreds.vyralabs.fun](https://shreds.vyralabs.fun)
+Ran live on the Vyra Labs testnet validator in Singapore until the node was retired on 29 Oct 2026. Recording of the dashboard running:
 
 The shred reading itself lives in [shred-core](https://github.com/vyralabshq/shred-core): parsing shreds, Merkle proofs and leader signatures, FEC sets and Reed-Solomon, and decoding entries and the block footer. shredtap runs it on a capture or a live interface, times every step and publishes what it finds.
 

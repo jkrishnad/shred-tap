@@ -1,6 +1,6 @@
 # shredtap web
 
-The page at [shreds.vyralabs.fun](https://shreds.vyralabs.fun). It shows the shreds reaching the Vyra Labs testnet validator, slot by slot, as shredtap decodes them.
+The page at [shreds.vyralabs.fun](https://shreds.vyralabs.fun). It showed the shreds reaching the Vyra Labs testnet validator, slot by slot, as shredtap decoded them. The node was retired on 29 Oct 2026, so the feed is off.
 
 ![shreds.vyralabs.fun](../docs/dashboard.png)
 
