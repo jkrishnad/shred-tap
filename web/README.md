@@ -2,9 +2,9 @@
 
 The page at [shreds.vyralabs.fun](https://shreds.vyralabs.fun). It showed the shreds reaching the Vyra Labs testnet validator, slot by slot, as shredtap decoded them. The node was retired on 29 Oct 2026, so the feed is off.
 
-![shreds.vyralabs.fun](../docs/dashboard.png)
+![shredtap dashboard](../docs/dashboard.png)
 
-A static Next.js export with shadcn components and Recharts. There is no server of its own: the browser connects straight to the node's NATS websocket, through Caddy at `/feed`.
+A static Next.js export with shadcn components and Recharts. It has no server of its own. The browser connects straight to the NATS websocket that `shredtap live --nats` publishes to.
 
 ## What it reads
 
@@ -26,6 +26,8 @@ npm install
 npm run dev
 ```
 
-Without `NEXT_PUBLIC_FEED_URL` the page connects to `ws://localhost:4280`, the node's NATS websocket through an SSH tunnel. NATS only accepts websockets from the site's origins and `http://localhost:3000`.
+Until the feed connects, the page shows the node as offline. It keeps retrying in the background.
 
-`npm run build` writes the static site to `out/`. Vercel builds it with `NEXT_PUBLIC_FEED_URL=wss://node.vyralabs.fun/feed`.
+Without `NEXT_PUBLIC_FEED_URL` the page connects to `ws://localhost:4280`, the websocket port in `../deploy/nats.conf`. NATS only accepts websockets from the origins in its `allowed_origins`, which includes `http://localhost:3000` for `npm run dev`.
+
+`npm run build` writes the static site to `out/`. Set `NEXT_PUBLIC_FEED_URL` at build time to your feed's `wss://` address.

@@ -122,14 +122,13 @@ export default function Dashboard() {
   const readyTicks = roundTicks(Math.max(0, ...series.map((p) => p.p99 ?? 0)));
   const pill =
     feed.connection !== "live"
-      ? { state: "none" as State, label: feed.connection }
+      ? { state: "bad" as State, label: "node offline" }
       : !last
         ? { state: "none" as State, label: "waiting for stats" }
         : health(last);
   const h = pill.state;
 
-  return (
-    <main className="mx-auto grid max-w-7xl gap-4 px-4 py-5">
+  const header = (
       <header className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <h1 className="text-lg font-semibold">shreds</h1>
         <span className="text-sm text-muted-foreground">Vyra Labs testnet validator · Singapore · UDP 8001</span>
@@ -143,6 +142,21 @@ export default function Dashboard() {
           <span>updated <b className="font-mono text-foreground"><Age at={feed.lastAt} /></b></span>
         </div>
       </header>
+  );
+
+  // nothing to draw without a feed, so one card says why instead of empty panels
+  if (feed.connection !== "live") {
+    return (
+      <main className="mx-auto grid max-w-7xl gap-4 px-4 py-5">
+        {header}
+        <Offline />
+      </main>
+    );
+  }
+
+  return (
+    <main className="mx-auto grid max-w-7xl gap-4 px-4 py-5">
+      {header}
 
       <Card>
         <CardHeader>
@@ -335,6 +349,20 @@ export default function Dashboard() {
         </Badge>
       )}
     </main>
+  );
+}
+
+function Offline() {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Node offline</CardTitle>
+        <CardDescription>
+          The feed cannot be reached, so there is nothing live to show. The Vyra Labs testnet validator this page
+          watched was retired on 29 Oct 2026. The page keeps trying and fills in if the feed comes back.
+        </CardDescription>
+      </CardHeader>
+    </Card>
   );
 }
 

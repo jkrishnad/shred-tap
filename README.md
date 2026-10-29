@@ -4,7 +4,7 @@ Watch the shreds that reach your Solana validator and rebuild the blocks from th
 
 shredtap reads the shreds arriving at a node, from a packet capture or live from the network interface. It puts the FEC sets back together, rebuilds missing pieces with Reed-Solomon and decodes every transaction, with the nanosecond time its shreds arrived. It only reads. It never sends anything to the cluster and never touches the validator.
 
-Ran live on the Vyra Labs testnet validator in Singapore until the node was retired on 29 Oct 2026. Recording of the dashboard running:
+Ran live on the Vyra Labs testnet validator in Singapore until the node was retired on 29 Oct 2026.
 
 The shred reading itself lives in [shred-core](https://github.com/vyralabshq/shred-core): parsing shreds, Merkle proofs and leader signatures, FEC sets and Reed-Solomon, and decoding entries and the block footer. shredtap runs it on a capture or a live interface, times every step and publishes what it finds.
 
@@ -89,15 +89,15 @@ With `--nats` every event goes to a NATS server on these subjects.
 
 The capture thread never waits for NATS. Events wait on a bounded queue, and a publisher that falls behind drops transactions first and counts what it dropped in the next rollup.
 
-`deploy/` holds the setup the testnet node runs: systemd units for shredtap and NATS, the NATS config and a timer that keeps the leader schedule one epoch ahead. shredtap runs as the validator's user at the lowest CPU priority, capped at 512 MB.
+`deploy/` holds the setup the Vyra Labs testnet node ran, to start from on your own node. It has systemd units for shredtap and NATS, the NATS config and a timer that keeps the leader schedule one epoch ahead. The unit runs shredtap as the validator's user at the lowest CPU priority, capped at 512 MB.
 
 ## The page
 
-`web/` is the page at [shreds.vyralabs.fun](https://shreds.vyralabs.fun), a static Next.js export on Vercel. The browser connects to the NATS websocket through Caddy at `/feed`, as a public user that may only read `shred.public` and the `shred.history` snapshot. Every transaction, set and marker stays on the node.
+`web/` is a dashboard for the live feed, a static Next.js export. It ran at shreds.vyralabs.fun until the node was retired on 29 Oct 2026. The browser connects to the NATS websocket as a public user that may only read `shred.public` and the `shred.history` snapshot. Every transaction, set and marker stays on the node.
 
 It shows the last 120 slots, missing data shreds per slot, set ready time, integrity counters for the last minute, recent slots and sampled transactions that link to the explorer. Hovering a panel pauses it.
 
-![shreds.vyralabs.fun](docs/dashboard.png)
+![shredtap dashboard](docs/dashboard.png)
 
 ```sh
 cd web
@@ -105,7 +105,7 @@ npm install
 npm run dev
 ```
 
-Without `NEXT_PUBLIC_FEED_URL` the page connects to `ws://localhost:4280`, the node's NATS websocket through an SSH tunnel.
+Without `NEXT_PUBLIC_FEED_URL` the page connects to `ws://localhost:4280`, the websocket port in `deploy/nats.conf`. Set it to your own feed's address. NATS only accepts websockets from the origins in `allowed_origins`, so add your site there.
 
 ## What it showed
 
